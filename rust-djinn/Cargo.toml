@@ -1,0 +1,14 @@
+[package]
+name = "djinn"
+version = "0.1.0"
+edition = "2021"
+description = "Djinn: unambiguous specification as Rust macros, verified through Aeneas"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+djinn-macros = { path = "macros" }
+
+[workspace]
+members = ["macros", "syntax", "cargo-djinn", "lsp"]

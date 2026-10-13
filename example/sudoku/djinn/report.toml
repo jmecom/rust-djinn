@@ -1,0 +1,150 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-13 03:53:32 UTC"
+unix_time = 1791863612
+duration_secs = 18
+pass = true
+stage = "done"
+errors = []
+
+[[decl]]
+name = "sameunit"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = i < 81 & & 0 < = j < 81 ) ] pub rel sameunit ( i : int , j : int ) - > b : bool { b = = ( i / 9 = = j / 9 | | i % 9 = = j % 9 | | ( i / 27 = = j / 27 & & ( i % 9 ) / 3 = = ( j % 9 ) / 3 ) ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "completion"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["sameunit"]
+tokens = "# [ requires ( g . len () = = 81 ) ] pub rel completion ( g : & [ u8 ] ) - > c : Vec < u8 > { c . len () = = 81 ; for i in 0 . . 81 { 1 < = c [ i ] < = 9 ; g [ i ] ! = 0 = > c [ i ] = = g [ i ] ; } for i in 0 . . 81 { for j in 0 . . 81 { i ! = j & & sameunit ( i , j ) = > c [ i ] ! = c [ j ] ; } } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "prefixthen"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( g . len () = = 81 & & c . len () = = 81 & & 0 < = i < 81 ) ] pub rel prefixthen ( g : & [ u8 ] , c : & [ u8 ] , i : int , d : int ) - > h : Vec < u8 > { h . len () = = 81 ; for j in 0 . . i { h [ j ] = = c [ j ] ; } h [ i ] = = d ; for j in i + 1 . . 81 { h [ j ] = = g [ j ] ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "solve"
+kind = "func"
+implemented = true
+ok = true
+uses = [
+    "completion",
+    "prefixthen",
+]
+tokens = "# [ requires ( g . len () = = 81 ) ] # [ ensures ( a . is_some () = = ( g in domain ( completion ) ) ) ] # [ ensures ( a . is_some () = > completion ( g ) = = a . unwrap () ) ] pub fn solve ( g : & [ u8 ] ) - > a : Option < Vec < u8 > > { if g in domain ( completion ) { a . is_some () ; completion ( g ) = = a . unwrap () ; for i in 0 . . 81 { if g [ i ] = = 0 { for d in 1 . . a . unwrap () [ i ] { prefixthen ( g , a . unwrap () , i , d ) not in domain ( completion ) ; } } } } else { a = = None ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+ens_1 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "digitof"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ ensures ( 0 < = d < = 9 ) ] pub fn digitof ( ch : u8 ) - > d : u8 { d = = if 49 < = ch & & ch < = 57 { ch - 48 } else { 0 } ; }"
+
+[decl.obligations]
+ens_0 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "parsepuzzle"
+kind = "func"
+implemented = true
+ok = true
+uses = ["digitof"]
+tokens = "# [ requires ( s . len () = = 81 ) ] # [ ensures ( g . len () = = 81 ) ] pub fn parsepuzzle ( s : & [ u8 ] ) - > g : Vec < u8 > { g . len () = = 81 ; for i in 0 . . 81 { g [ i ] = = digitof ( s [ i ] ) ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "digitchar"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn digitchar ( d : u8 ) - > ch : u8 { ch = = if d < = 9 { 48 + d } else { 63 } ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "showgrid"
+kind = "func"
+implemented = true
+ok = true
+uses = ["digitchar"]
+tokens = "# [ requires ( c . len () = = 81 ) ] # [ ensures ( s . len () = = c . len () + 1 ) ] pub fn showgrid ( c : & [ u8 ] ) - > s : Vec < u8 > { s . len () = = c . len () + 1 ; for i in 0 . . c . len () { s [ i ] = = digitchar ( c [ i ] ) ; } s [ c . len () ] = = 10 ; }"
+
+[decl.obligations]
+ens_0 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "nosolutiontext"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ total ] pub rel nosolutiontext () - > s : Vec < u8 > { s . len () = = 12 ; s [ 0 ] = = 110 ; s [ 1 ] = = 111 ; s [ 2 ] = = 32 ; s [ 3 ] = = 115 ; s [ 4 ] = = 111 ; s [ 5 ] = = 108 ; s [ 6 ] = = 117 ; s [ 7 ] = = 116 ; s [ 8 ] = = 105 ; s [ 9 ] = = 111 ; s [ 10 ] = = 110 ; s [ 11 ] = = 10 ; }"
+
+[decl.obligations]
+exists = "proved"
+wf = "proved"
+
+[[decl]]
+name = "showanswer"
+kind = "func"
+implemented = true
+ok = true
+uses = [
+    "showgrid",
+    "nosolutiontext",
+]
+tokens = "# [ requires ( a . is_some () = > a . unwrap () . len () = = 81 ) ] pub fn showanswer ( a : Option < Vec < u8 > > ) - > s : Vec < u8 > { if a . is_some () { showgrid ( a . unwrap () ) = = s ; } else { nosolutiontext () = = s ; } }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"

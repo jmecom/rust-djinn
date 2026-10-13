@@ -1,0 +1,119 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-13 04:58:17 UTC"
+unix_time = 1791867497
+duration_secs = 6
+pass = true
+stage = "done"
+errors = []
+
+[[decl]]
+name = "copies"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = l & & 1 < = d < = j & & j + l < = s . len () ) ] # [ decreases ( l ) ] pub rel copies ( l : int , s : & [ u8 ] , j : int , d : int ) - > b : bool { b = = ( l = = 0 | | ( s [ j ] = = s [ j - d ] & & copies ( l - 1 , s , j + 1 , d ) ) ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "ismatch"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["copies"]
+tokens = "# [ requires ( 0 < = j < = s . len () ) ] pub rel ismatch ( s : & [ u8 ] , j : int , d : int , l : int ) - > b : bool { b = = ( 1 < = d < = WINDOW & & d < = j & & MINLEN < = l < = MAXLEN & & j + l < = s . len () & & copies ( l , s , j , d ) ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "toklen"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn toklen ( t : Token ) - > n : u32 { match t { Token : : Lit ( _ ) = > n = = 1 , Token : : Match { len , . . } = > n = = len , } }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "encoded"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["toklen"]
+tokens = "# [ decreases ( ts . len () ) ] pub rel encoded ( ts : & [ Token ] ) - > m : int { if ts . is_empty () { m = = 0 ; } else { m = = encoded ( ts [ . . ts . len () - 1 ] ) + toklen ( ts [ ts . len () - 1 ] ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "decode"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ decreases ( ts . len () ) ] pub rel decode ( ts : & [ Token ] ) - > s : Vec < u8 > { if ts . is_empty () { s . is_empty () ; } else { some p : Vec < u8 > { decode ( ts [ . . ts . len () - 1 ] ) = = p ; match ts [ ts . len () - 1 ] { Token : : Lit ( ch ) = > { s . len () = = p . len () + 1 ; s [ . . p . len () ] = = p ; s [ p . len () ] = = ch ; } Token : : Match { dist , len } = > { 1 < = dist < = p . len () ; 1 < = len ; s . len () = = p . len () + len ; s [ . . p . len () ] = = p ; for k in p . len () . . s . len () { s [ k ] = = s [ k - dist ] ; } } } } } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "mincost"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["ismatch"]
+tokens = "# [ requires ( 0 < = n < = s . len () ) ] # [ ensures ( 0 < = k < = n ) ] # [ decreases ( n ) ] pub rel mincost ( n : int , s : & [ u8 ] ) - > k : int { if n = = 0 { k = = 0 ; } else { k < = 1 + mincost ( n - 1 , s ) ; for l in MINLEN . . MAXLEN + 1 { for d in 1 . . WINDOW + 1 { ismatch ( s , s . len () - n , d , l ) = > k < = 1 + mincost ( n - l , s ) ; } } cases { k = = 1 + mincost ( n - 1 , s ) ; some l : int , d : int { ismatch ( s , s . len () - n , d , l ) ; k = = 1 + mincost ( n - l , s ) ; } } } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "besttoken"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "toklen",
+    "mincost",
+    "ismatch",
+]
+tokens = "# [ requires ( 1 < = n < = s . len () ) ] # [ ensures ( 1 < = toklen ( t ) < = n ) ] # [ ensures ( 1 + mincost ( n - toklen ( t ) , s ) = = mincost ( n , s ) ) ] pub rel besttoken ( n : int , s : & [ u8 ] ) - > t : Token { match t { Token : : Lit ( ch ) = > { ch = = s [ s . len () - n ] ; 1 + mincost ( n - 1 , s ) = = mincost ( n , s ) ; for l in MINLEN . . MAXLEN + 1 { for d in 1 . . WINDOW + 1 { ismatch ( s , s . len () - n , d , l ) = > 1 + mincost ( n - l , s ) ! = mincost ( n , s ) ; } } } Token : : Match { dist , len } = > { ismatch ( s , s . len () - n , dist , len ) ; 1 + mincost ( n - len , s ) = = mincost ( n , s ) ; for l in len + 1 . . MAXLEN + 1 { for d in 1 . . WINDOW + 1 { ismatch ( s , s . len () - n , d , l ) = > 1 + mincost ( n - l , s ) ! = mincost ( n , s ) ; } } for d in 1 . . dist { ismatch ( s , s . len () - n , d , len ) = > 1 + mincost ( n - len , s ) ! = mincost ( n , s ) ; } } } }"
+
+[decl.obligations]
+ens_0 = "proved"
+ens_1 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "compress"
+kind = "func"
+implemented = true
+ok = true
+uses = [
+    "decode",
+    "mincost",
+    "encoded",
+    "besttoken",
+]
+tokens = "# [ ensures ( decode ( ts ) = = s ) ] # [ ensures ( ts . len () = = mincost ( s . len () , s ) ) ] pub fn compress ( s : & [ u8 ] ) - > ts : Vec < Token > { encoded ( ts ) = = s . len () ; for i in 0 . . ts . len () { besttoken ( s . len () - encoded ( ts [ . . i ] ) , s ) = = ts [ i ] ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+ens_1 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"

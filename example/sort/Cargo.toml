@@ -1,0 +1,21 @@
+[package]
+name = "sortprog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The specification macros. Expansion is a delegation stub; no runtime cost.
+djinn = { path = "../../rust-djinn" }
+
+# Charon reads this section; `charon cargo` runs with the aeneas preset.
+[package.metadata.charon]
+preset = "aeneas"
+
+# cargo-djinn configuration.
+[package.metadata.djinn]
+spec = "src/spec.rs"
+namespace = "SortProg"
+aeneas_lean = "../../../../tools/aeneas/backends/lean"
+charon = "../../tools/aeneas/charon/bin/charon"
+aeneas = "../../tools/aeneas/bin/aeneas"
+bench = "bench::workload"

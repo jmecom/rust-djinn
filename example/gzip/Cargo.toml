@@ -1,0 +1,28 @@
+[package]
+name = "gzip"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+djinn = { path = "../../rust-djinn" }
+
+[package.metadata.charon]
+preset = "aeneas"
+
+[package.metadata.djinn]
+spec = "src/spec.rs"
+namespace = "Gzip"
+aeneas_lean = "../../../../tools/aeneas/backends/lean"
+charon = "../../tools/aeneas/charon/bin/charon"
+aeneas = "../../tools/aeneas/bin/aeneas"
+bench = "bench::workload_compress"
+bench_points = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # the levels: `optimize` judges the (size, time) curve over them
+
+# The profile of lean-zip's Rust comparator (`miniz-compress-file`), so that the race is fair;
+# `cargo djinn bench` builds its runner with the same profile. Verified code never panics, so
+# aborting on panic costs nothing.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

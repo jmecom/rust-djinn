@@ -1,0 +1,468 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-13 04:43:14 UTC"
+unix_time = 1791866594
+duration_secs = 289
+pass = true
+stage = "done"
+errors = []
+
+[[decl]]
+name = "bit"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel bit ( s : & [ u8 ] , i : int ) - > b : int { 0 < = i < 8 * s . len () ; b = = ( s [ i / 8 ] / 2 . pow ( i % 8 ) ) % 2 ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "field"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["bit"]
+tokens = "# [ requires ( 0 < = n ) ] # [ decreases ( n ) ] pub rel field ( s : & [ u8 ] , i : int , n : int ) - > v : int { if n = = 0 { v = = 0 ; } else { v = = bit ( s , i ) + 2 * field ( s , i + 1 , n - 1 ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "code"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["bit"]
+tokens = "# [ requires ( 0 < = n ) ] # [ decreases ( n ) ] pub rel code ( s : & [ u8 ] , i : int , n : int ) - > v : int { if n = = 0 { v = = 0 ; } else { v = = 2 * code ( s , i , n - 1 ) + bit ( s , i + n - 1 ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "u16le"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel u16le ( s : & [ u8 ] , i : int ) - > v : int { 0 < = i & & i + 2 < = s . len () ; v = = s [ i ] + 256 * s [ i + 1 ] ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "u32le"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["u16le"]
+tokens = "pub rel u32le ( s : & [ u8 ] , i : int ) - > v : int { v = = u16le ( s , i ) + 65536 * u16le ( s , i + 2 ) ; }"
+
+[decl.obligations]
+
+[[decl]]
+name = "shorter"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = k < = lens . len () ) ] # [ decreases ( k ) ] pub rel shorter ( lens : & [ u8 ] , k : int , n : int ) - > c : int { if k = = 0 { c = = 0 ; } else if 1 < = lens [ k - 1 ] < n { c = = shorter ( lens , k - 1 , n ) + 2 . pow ( n - lens [ k - 1 ] ) ; } else { c = = shorter ( lens , k - 1 , n ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "earlier"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = k < = lens . len () ) ] # [ decreases ( k ) ] pub rel earlier ( lens : & [ u8 ] , k : int , n : int ) - > c : int { if k = = 0 { c = = 0 ; } else if lens [ k - 1 ] = = n { c = = earlier ( lens , k - 1 , n ) + 1 ; } else { c = = earlier ( lens , k - 1 , n ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "codeword"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "shorter",
+    "earlier",
+]
+tokens = "pub rel codeword ( lens : & [ u8 ] , sym : int ) - > c : int { 0 < = sym < lens . len () ; c = = shorter ( lens , lens . len () , lens [ sym ] ) + earlier ( lens , sym , lens [ sym ] ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "valid"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["shorter"]
+tokens = "# [ requires ( 0 < = n ) ] pub rel valid ( lens : & [ u8 ] , n : int ) - > b : bool { b = = ( lens . iter () . all ( | l | l < = n ) & & shorter ( lens , lens . len () , n + 1 ) < = 2 . pow ( n + 1 ) ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "symbol"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "code",
+    "codeword",
+]
+tokens = "pub rel symbol ( s : & [ u8 ] , i : int , lens : & [ u8 ] ) - > sym : int { 0 < = sym < lens . len () ; 1 < = lens [ sym ] ; code ( s , i , lens [ sym ] ) = = codeword ( lens , sym ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "fixedlen"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel fixedlen ( sym : int ) - > n : int { n = = if sym < 144 { 8 } else if sym < 256 { 9 } else if sym < 280 { 7 } else { 8 } ; }"
+
+[decl.obligations]
+
+[[decl]]
+name = "fixedlit"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["fixedlen"]
+tokens = "# [ override_smoke_test ] pub rel fixedlit () - > lens : Vec < u8 > { lens . len () = = 288 ; for k in 0 . . 288 { lens [ k ] = = fixedlen ( k ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "fixeddist"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel fixeddist () - > lens : Vec < u8 > { lens . len () = = 32 ; for l in lens { l = = 5 ; } }"
+
+[decl.obligations]
+
+[[decl]]
+name = "lextra"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ ensures ( 0 < = e ) ] pub rel lextra ( k : int ) - > e : int { 0 < = k < = 28 ; if k < 8 | | k = = 28 { e = = 0 ; } else { e = = k / 4 - 1 ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "lbase"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["lextra"]
+tokens = "# [ requires ( 0 < = k ) ] # [ decreases ( k ) ] pub rel lbase ( k : int ) - > b : int { k < = 28 ; if k = = 0 { b = = 3 ; } else if k = = 28 { b = = 258 ; } else { b = = lbase ( k - 1 ) + 2 . pow ( lextra ( k - 1 ) ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "dextra"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ ensures ( 0 < = e ) ] pub rel dextra ( k : int ) - > e : int { 0 < = k < = 29 ; if k < 4 { e = = 0 ; } else { e = = k / 2 - 1 ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "dbase"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["dextra"]
+tokens = "# [ requires ( 0 < = k ) ] # [ decreases ( k ) ] pub rel dbase ( k : int ) - > b : int { k < = 29 ; if k = = 0 { b = = 1 ; } else { b = = dbase ( k - 1 ) + 2 . pow ( dextra ( k - 1 ) ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "append"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel append ( prev : & [ u8 ] , x : int ) - > out : Vec < u8 > { out . len () = = prev . len () + 1 ; out [ . . prev . len () ] = = prev ; out [ prev . len () ] = = x ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "copy"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel copy ( prev : & [ u8 ] , d : int , len : int ) - > out : Vec < u8 > { 1 < = d < = prev . len () ; out . len () = = prev . len () + len ; out [ . . prev . len () ] = = prev ; for k in prev . len () . . out . len () { out [ k ] = = out [ k - d ] ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "symbols"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "symbol",
+    "append",
+    "lbase",
+    "field",
+    "lextra",
+    "dbase",
+    "dextra",
+    "copy",
+]
+tokens = "# [ decreases ( 8 * s . len () - i ) ] pub rel symbols ( s : & [ u8 ] , i : int , lit : & [ u8 ] , dist : & [ u8 ] , prev : & [ u8 ] , out : & [ u8 ] ) - > j : int { some sym : int , a : int { symbol ( s , i , lit ) = = sym ; a = = i + lit [ sym ] ; i < a < = 8 * s . len () ; if sym = = 256 { out = = prev ; j = = a ; } else if sym < 256 { symbols ( s , a , lit , dist , append ( prev , sym ) , out ) = = j ; } else { some len : int , b : int , dc : int , d : int , c : int { len = = lbase ( sym - 257 ) + field ( s , a , lextra ( sym - 257 ) ) ; b = = a + lextra ( sym - 257 ) ; symbol ( s , b , dist ) = = dc ; d = = dbase ( dc ) + field ( s , b + dist [ dc ] , dextra ( dc ) ) ; c = = b + dist [ dc ] + dextra ( dc ) ; a < c < = 8 * s . len () ; symbols ( s , c , lit , dist , copy ( prev , d , len ) , out ) = = j ; } } } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "stored"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["u16le"]
+tokens = "pub rel stored ( s : & [ u8 ] , i : int , prev : & [ u8 ] , out : & [ u8 ] ) - > j : int { some a : int , len : int { a = = ( i + 7 ) / 8 ; len = = u16le ( s , a ) ; u16le ( s , a + 2 ) = = 65535 - len ; a + 4 + len < = s . len () ; out . len () = = prev . len () + len ; out [ . . prev . len () ] = = prev ; out [ prev . len () . . out . len () ] = = s [ a + 4 . . a + 4 + len ] ; j = = 8 * ( a + 4 + len ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "lengths"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "symbol",
+    "field",
+]
+tokens = "# [ requires ( 0 < = p < = all . len () ) ] # [ decreases ( all . len () - p ) ] pub rel lengths ( s : & [ u8 ] , i : int , cl : & [ u8 ] , p : int , all : & [ u8 ] ) - > j : int { if p = = all . len () { j = = i ; } else { some sym : int , a : int , n : int { symbol ( s , i , cl ) = = sym ; a = = i + cl [ sym ] ; if sym < 16 { n = = 1 ; for k in p . . p + n { all [ k ] = = sym ; } lengths ( s , a , cl , p + n , all ) = = j ; } else if sym = = 16 { 1 < = p ; n = = 3 + field ( s , a , 2 ) ; p < p + n < = all . len () ; for k in p . . p + n { all [ k ] = = all [ p - 1 ] ; } lengths ( s , a + 2 , cl , p + n , all ) = = j ; } else if sym = = 17 { n = = 3 + field ( s , a , 3 ) ; p < p + n < = all . len () ; for k in p . . p + n { all [ k ] = = 0 ; } lengths ( s , a + 3 , cl , p + n , all ) = = j ; } else { sym = = 18 ; n = = 11 + field ( s , a , 7 ) ; p < p + n < = all . len () ; for k in p . . p + n { all [ k ] = = 0 ; } lengths ( s , a + 7 , cl , p + n , all ) = = j ; } } } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "tables"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "field",
+    "valid",
+    "lengths",
+]
+tokens = "pub rel tables ( s : & [ u8 ] , i : int , lit : & [ u8 ] , dist : & [ u8 ] ) - > j : int { some hclen : int , cl : Vec < u8 > , all : Vec < u8 > { lit . len () = = 257 + field ( s , i , 5 ) ; dist . len () = = 1 + field ( s , i + 5 , 5 ) ; hclen = = 4 + field ( s , i + 10 , 4 ) ; cl . len () = = 19 ; for k in 0 . . 19 { if k < hclen { cl [ CL_ORDER [ k ] ] = = field ( s , i + 14 + 3 * k , 3 ) ; } else { cl [ CL_ORDER [ k ] ] = = 0 ; } } valid ( cl , 7 ) ; all . len () = = lit . len () + dist . len () ; all [ . . lit . len () ] = = lit ; all [ lit . len () . . all . len () ] = = dist ; lengths ( s , i + 14 + 3 * hclen , cl , 0 , all ) = = j ; valid ( lit , 15 ) ; valid ( dist , 15 ) ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "block"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "field",
+    "stored",
+    "symbols",
+    "fixedlit",
+    "fixeddist",
+    "tables",
+]
+tokens = "pub rel block ( s : & [ u8 ] , i : int , prev : & [ u8 ] , out : & [ u8 ] ) - > j : int { if field ( s , i , 2 ) = = 0 { stored ( s , i + 2 , prev , out ) = = j ; } else if field ( s , i , 2 ) = = 1 { symbols ( s , i + 2 , fixedlit () , fixeddist () , prev , out ) = = j ; } else { field ( s , i , 2 ) = = 2 ; some lit : Vec < u8 > , dist : Vec < u8 > , k : int { tables ( s , i + 2 , lit , dist ) = = k ; symbols ( s , k , lit , dist , prev , out ) = = j ; } } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "blocks"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "bit",
+    "block",
+]
+tokens = "# [ decreases ( 8 * s . len () - i ) ] pub rel blocks ( s : & [ u8 ] , i : int , prev : & [ u8 ] , out : & [ u8 ] ) - > j : int { if bit ( s , i ) = = 0 { some mid : Vec < u8 > , k : int { block ( s , i + 1 , prev , mid ) = = k ; i < k < = 8 * s . len () ; blocks ( s , k , mid , out ) = = j ; } } else { block ( s , i + 1 , prev , out ) = = j ; } }"
+
+[decl.obligations]
+
+[[decl]]
+name = "xor"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = a & & 0 < = b ) ] # [ ensures ( 0 < = c ) ] # [ decreases ( a + b ) ] pub rel xor ( a : int , b : int ) - > c : int { if a = = 0 & & b = = 0 { c = = 0 ; } else { c = = ( a + b ) % 2 + 2 * xor ( a / 2 , b / 2 ) ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "crcbit"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["xor"]
+tokens = "# [ requires ( 0 < = c ) ] # [ ensures ( 0 < = d ) ] pub rel crcbit ( c : int ) - > d : int { if c % 2 = = 1 { d = = xor ( c / 2 , POLY ) ; } else { d = = c / 2 ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "crcbits"
+kind = "rel"
+implemented = true
+ok = true
+uses = ["crcbit"]
+tokens = "# [ requires ( 0 < = c & & 0 < = n ) ] # [ ensures ( 0 < = d ) ] # [ decreases ( n ) ] pub rel crcbits ( c : int , n : int ) - > d : int { if n = = 0 { d = = c ; } else { d = = crcbit ( crcbits ( c , n - 1 ) ) ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "crcreg"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "crcbits",
+    "xor",
+]
+tokens = "# [ requires ( 0 < = n < = data . len () ) ] # [ ensures ( 0 < = c ) ] # [ decreases ( n ) ] pub rel crcreg ( data : & [ u8 ] , n : int ) - > c : int { if n = = 0 { c = = 4294967295 ; } else { c = = crcbits ( xor ( crcreg ( data , n - 1 ) , data [ n - 1 ] ) , 8 ) ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+wf = "proved"
+
+[[decl]]
+name = "crc32"
+kind = "func"
+implemented = true
+ok = true
+uses = [
+    "xor",
+    "crcreg",
+]
+tokens = "pub fn crc32 ( data : & [ u8 ] ) - > c : u32 { c = = xor ( crcreg ( data , data . len () ) , 4294967295 ) ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "flag"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( 0 < = k ) ] pub rel flag ( f : int , k : int ) - > b : bool { b = = ( ( f / 2 . pow ( k ) ) % 2 = = 1 ) ; }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "zero"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "pub rel zero ( s : & [ u8 ] , i : int ) - > z : int { 0 < = i < = z < s . len () ; s [ z ] = = 0 ; for k in i . . z { s [ k ] ! = 0 ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "header"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "flag",
+    "u16le",
+    "zero",
+]
+tokens = "pub rel header ( s : & [ u8 ] ) - > n : int { 10 < = s . len () ; s [ 0 ] = = 31 & & s [ 1 ] = = 139 & & s [ 2 ] = = 8 ; s [ 3 ] < 32 ; some a : int , b : int , c : int { if flag ( s [ 3 ] , 2 ) { a = = 12 + u16le ( s , 10 ) ; } else { a = = 10 ; } if flag ( s [ 3 ] , 3 ) { b = = zero ( s , a ) + 1 ; } else { b = = a ; } if flag ( s [ 3 ] , 4 ) { c = = zero ( s , b ) + 1 ; } else { c = = b ; } if flag ( s [ 3 ] , 1 ) { n = = c + 2 ; } else { n = = c ; } n < = s . len () ; } }"
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "member"
+kind = "rel"
+implemented = true
+ok = true
+uses = [
+    "header",
+    "blocks",
+    "u32le",
+    "crc32",
+]
+tokens = 'pub rel member ( s : & [ u8 ] ) - > out : Vec < u8 > { some h : int , j : int , t : int { header ( s ) = = h ; blocks ( s , 8 * h , b"" , out ) = = j ; t = = ( j + 7 ) / 8 ; s . len () = = t + 8 ; u32le ( s , t ) = = crc32 ( out ) ; u32le ( s , t + 4 ) = = out . len () % 4294967296 ; } }'
+
+[decl.obligations]
+wf = "proved"
+
+[[decl]]
+name = "decompress"
+kind = "func"
+implemented = true
+ok = true
+uses = ["member"]
+tokens = "pub fn decompress ( s : & [ u8 ] ) - > r : Option < Vec < u8 > > { r . is_some () = = ( s in domain ( member ) & & member ( s ) . len () < = MAXOUT ) ; r . is_some () = > member ( s ) = = r . unwrap () ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "compress"
+kind = "func"
+implemented = true
+ok = true
+uses = ["decompress"]
+tokens = "# [ weakly_specified ] # [ requires ( data . len () < = MAXOUT ) ] # [ ensures ( decompress ( out ) = = Some ( data ) ) ] pub fn compress ( data : & [ u8 ] , level : u8 ) - > out : Vec < u8 > { any o : Vec < u8 > where decompress ( o ) = = Some ( data ) ; out = = o ; out . len () > = 18 ; out [ . . 8 ] = = HEADER ; out [ 8 ] = = if level = = 0 { 0 } else if level < 5 { 4 } else { 2 } ; out [ 9 ] = = 255 ; }"
+weakly_specified = true
+
+[decl.obligations]
+ens_0 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"

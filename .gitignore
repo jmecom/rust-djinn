@@ -1,0 +1,8 @@
+bigexample
+.djinnscratch
+target
+.DS_Store
+.lake
+tools
+*.swp
+corpora

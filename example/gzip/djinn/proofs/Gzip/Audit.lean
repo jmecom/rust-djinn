@@ -1,0 +1,52 @@
+/-  Audit.lean — generated; `cargo djinn verify` runs it and accepts only
+    propext, Classical.choice and Quot.sound. -/
+import Gzip.Obligations
+
+#print axioms Gzip.Obligations.bit.wf
+#print axioms Gzip.Obligations.field.wf
+#print axioms Gzip.Obligations.code.wf
+#print axioms Gzip.Obligations.u16le.wf
+#print axioms Gzip.Obligations.shorter.wf
+#print axioms Gzip.Obligations.earlier.wf
+#print axioms Gzip.Obligations.codeword.wf
+#print axioms Gzip.Obligations.valid.wf
+#print axioms Gzip.Obligations.symbol.wf
+#print axioms Gzip.Obligations.fixedlit.wf
+#print axioms Gzip.Obligations.lextra.ens_0
+#print axioms Gzip.Obligations.lextra.wf
+#print axioms Gzip.Obligations.lbase.wf
+#print axioms Gzip.Obligations.dextra.ens_0
+#print axioms Gzip.Obligations.dextra.wf
+#print axioms Gzip.Obligations.dbase.wf
+#print axioms Gzip.Obligations.append.wf
+#print axioms Gzip.Obligations.copy.wf
+#print axioms Gzip.Obligations.symbols.wf
+#print axioms Gzip.Obligations.stored.wf
+#print axioms Gzip.Obligations.lengths.wf
+#print axioms Gzip.Obligations.tables.wf
+#print axioms Gzip.Obligations.block.wf
+#print axioms Gzip.Obligations.xor.ens_0
+#print axioms Gzip.Obligations.xor.wf
+#print axioms Gzip.Obligations.crcbit.ens_0
+#print axioms Gzip.Obligations.crcbit.wf
+#print axioms Gzip.Obligations.crcbits.ens_0
+#print axioms Gzip.Obligations.crcbits.wf
+#print axioms Gzip.Obligations.crcreg.ens_0
+#print axioms Gzip.Obligations.crcreg.wf
+#print axioms Gzip.Obligations.crc32.unambiguous
+#print axioms Gzip.Obligations.crc32.wf
+#print axioms Gzip.Obligations.crc32.impl_correct
+#print axioms Gzip.Obligations.crc32.exists
+#print axioms Gzip.Obligations.flag.wf
+#print axioms Gzip.Obligations.zero.wf
+#print axioms Gzip.Obligations.header.wf
+#print axioms Gzip.Obligations.member.wf
+#print axioms Gzip.Obligations.decompress.unambiguous
+#print axioms Gzip.Obligations.decompress.wf
+#print axioms Gzip.Obligations.decompress.impl_correct
+#print axioms Gzip.Obligations.decompress.exists
+#print axioms Gzip.Obligations.compress.unambiguous
+#print axioms Gzip.Obligations.compress.ens_0
+#print axioms Gzip.Obligations.compress.wf
+#print axioms Gzip.Obligations.compress.impl_correct
+#print axioms Gzip.Obligations.compress.exists

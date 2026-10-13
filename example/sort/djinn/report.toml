@@ -1,0 +1,62 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-13 04:34:16 UTC"
+unix_time = 1791866056
+duration_secs = 5
+pass = true
+stage = "done"
+errors = []
+
+[[decl]]
+name = "perm"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ total ] pub rel perm ( list : & [ i32 ] ) - > t : Vec < i32 > { t . len () = = list . len () ; for x in list { t . iter () . filter ( | y | y = = x ) . count () = = list . iter () . filter ( | y | y = = x ) . count () ; } for x in t { t . iter () . filter ( | y | y = = x ) . count () = = list . iter () . filter ( | y | y = = x ) . count () ; } }"
+
+[decl.obligations]
+exists = "proved"
+
+[[decl]]
+name = "permsuperset"
+kind = "rel"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ total ] pub rel permsuperset ( list : & [ i32 ] ) - > t : Vec < i32 > { t . len () > = list . len () ; for x in list { t . iter () . filter ( | y | y = = x ) . count () = = list . iter () . filter ( | y | y = = x ) . count () ; } }"
+
+[decl.obligations]
+exists = "proved"
+
+[[decl]]
+name = "sort"
+kind = "func"
+implemented = true
+ok = true
+uses = ["perm"]
+tokens = "pub fn sort ( v : & mut Vec < i32 > ) { perm ( old ( v ) ) = = v ; for i in 0 . . v . len () - 1 { v [ i ] < = v [ i + 1 ] ; } }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+wf = "proved"
+
+[[decl]]
+name = "max"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "# [ requires ( list . len () > = 1 ) ] # [ ensures ( r in list ) ] pub fn max ( list : & [ i32 ] ) - > r : i32 { r in list ; for x in list { x < = r ; } }"
+
+[decl.obligations]
+ens_0 = "proved"
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"

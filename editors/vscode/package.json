@@ -1,0 +1,64 @@
+{
+  "name": "rust-djinn",
+  "displayName": "Djinn for Rust",
+  "description": "Proof status after every function, smoke-test lint, implement/verify and jumps to the obligations, proofs and guide for Djinn specifications in Rust files (runs beside rust-analyzer).",
+  "version": "0.2.0",
+  "publisher": "djinn",
+  "engines": { "vscode": "^1.85.0" },
+  "activationEvents": ["onLanguage:rust"],
+  "main": "./extension.js",
+  "contributes": {
+    "configurationDefaults": {
+      "rust-analyzer.cargo.extraEnv": { "DJINN_GATE": "off" }
+    },
+    "configuration": {
+      "title": "Djinn",
+      "properties": {
+        "djinn.serverPath": { "type": "string", "default": "rust-djinn-lsp", "description": "Path to the rust-djinn-lsp binary (default: on PATH, else ~/.cargo/bin, else the debug build next to this extension's checkout)." },
+        "djinn.driverPath": { "type": "string", "default": "", "description": "Path to cargo-djinn (default: next to the server binary)." },
+        "djinn.agent": { "type": "string", "default": "codex", "enum": ["claude", "codex"], "description": "Agent used by the implement command." },
+        "djinn.status": {
+          "type": "string",
+          "default": "line",
+          "enum": ["line", "inlayHint", "off"],
+          "enumDescriptions": [
+            "Draw the proof status after each fn/rel line, coloured (green: verified, red: smoke-test finding); the server's inlay hint is hidden so it is not shown twice.",
+            "Show the server's inlay hint at the end of the fn line instead.",
+            "Neither; the status stays in the code lens above the function."
+          ],
+          "description": "How the proof status of every fn/rel is shown."
+        }
+      }
+    },
+    "commands": [
+      { "command": "djinn.implementActive", "title": "Djinn: Implement (run the agent)" },
+      { "command": "djinn.verifyActive", "title": "Djinn: Verify" },
+      { "command": "djinn.smokeTestActive", "title": "Djinn: Smoke-test the specification" },
+      { "command": "djinn.openObligationsActive", "title": "Djinn: Open the proof obligations (of the function under the cursor)" },
+      { "command": "djinn.openProofsActive", "title": "Djinn: Open the proofs (of the function under the cursor)" },
+      { "command": "djinn.openGuideActive", "title": "Djinn: Open the guide" },
+      { "command": "djinn.statusActive", "title": "Djinn: Status" }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "djinn.implementActive", "when": "editorLangId == rust" },
+        { "command": "djinn.verifyActive", "when": "editorLangId == rust" },
+        { "command": "djinn.smokeTestActive", "when": "editorLangId == rust" },
+        { "command": "djinn.openObligationsActive", "when": "editorLangId == rust" },
+        { "command": "djinn.openProofsActive", "when": "editorLangId == rust" },
+        { "command": "djinn.openGuideActive", "when": "editorLangId == rust" },
+        { "command": "djinn.statusActive", "when": "editorLangId == rust" }
+      ]
+    },
+    "keybindings": [
+      { "command": "djinn.implementActive", "key": "ctrl+alt+d i", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.verifyActive", "key": "ctrl+alt+d v", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.smokeTestActive", "key": "ctrl+alt+d s", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.openObligationsActive", "key": "ctrl+alt+d o", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.openProofsActive", "key": "ctrl+alt+d p", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.openGuideActive", "key": "ctrl+alt+d g", "when": "editorTextFocus && editorLangId == rust" },
+      { "command": "djinn.statusActive", "key": "ctrl+alt+d shift+s", "when": "editorTextFocus && editorLangId == rust" }
+    ]
+  },
+  "dependencies": { "vscode-languageclient": "^9.0.1" }
+}

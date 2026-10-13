@@ -1,0 +1,18 @@
+[package]
+name = "rust-djinn-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "Language server for Djinn specifications inside Rust files: proof status, smoke-test linting, implement/verify commands, jump to obligations"
+
+[[bin]]
+name = "rust-djinn-lsp"
+path = "src/main.rs"
+
+[dependencies]
+cargo-djinn = { path = "../cargo-djinn" }
+djinn-syntax = { path = "../syntax" }
+lsp-server = "0.10"
+lsp-types = "0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"

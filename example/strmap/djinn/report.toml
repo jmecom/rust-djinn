@@ -1,0 +1,74 @@
+# Written by `cargo djinn` after every verify. Per declaration: its tokens as
+# verified, what it uses, and the status of each obligation. The `djinn!`
+# macro refuses to compile a `fn` that is not `ok` here or whose tokens (or a
+# used declaration's) differ from this file. Commit it with solution/ and proofs/.
+
+[run]
+time = "2026-10-05 05:05:35 UTC"
+unix_time = 1791176735
+duration_secs = 4
+pass = true
+stage = "done"
+errors = []
+
+[[decl]]
+name = "byte_len"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn byte_len ( s : String ) - > r : usize { r = = s . len () ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "has_key"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn has_key ( m : HashMap < u32 , u64 > , k : u32 ) - > r : bool { r = = m . contains_key ( & k ) ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "lookup"
+kind = "func"
+implemented = true
+ok = true
+uses = []
+tokens = "pub fn lookup ( m : HashMap < u32 , u64 > , k : u32 ) - > r : Option < u64 > { r = = m . get ( & k ) ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "lookup_next"
+kind = "func"
+implemented = true
+ok = true
+uses = ["bump"]
+tokens = "pub fn lookup_next ( m : HashMap < u32 , u64 > , k : u32 ) - > r : Option < u64 > { r = = m . get ( & bump ( k ) ) ; }"
+
+[decl.obligations]
+exists = "proved"
+impl_correct = "proved"
+unambiguous = "proved"
+
+[[decl]]
+name = "bump"
+kind = "ambient"
+implemented = true
+ok = true
+uses = []
+tokens = '# [ doc = " An ambient function: trusted Rust, callable from constraints, meaning its" ] # [ doc = " Aeneas translation. (The guard keeps it from overflowing.)" ] pub fn bump ( x : u32 ) - > u32 { if x < 1_000_000 { x + 1 } else { x } }'
+
+[decl.obligations]

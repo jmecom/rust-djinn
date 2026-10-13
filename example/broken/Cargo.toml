@@ -1,0 +1,11 @@
+[package]
+name = "broken"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+djinn = { path = "../../rust-djinn" }
+
+[package.metadata.djinn]
+spec = "src/spec.rs"
+namespace = "Broken"

@@ -1,0 +1,18 @@
+[package]
+name = "clampdemo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+djinn = { path = "../../rust-djinn" }
+
+[package.metadata.charon]
+preset = "aeneas"
+
+[package.metadata.djinn]
+spec = "src/spec.rs"
+namespace = "ClampDemo"
+aeneas_lean = "../../../../tools/aeneas/backends/lean"
+charon = "../../tools/aeneas/charon/bin/charon"
+aeneas = "../../tools/aeneas/bin/aeneas"
+bench = "bench::workload"
