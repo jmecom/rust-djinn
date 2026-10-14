@@ -2,6 +2,8 @@
 
 **Write what your program must compute. Let an LLM figure out how.**
 
+[Blog post](https://henniger.dev/post/djinn)
+
 rust-djinn is a specification language that is also a programming language.
 Djinn functions consist of *constraints*: they relate function inputs to
 outputs. An LLM writes the code
