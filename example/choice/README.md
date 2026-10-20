@@ -1,7 +1,7 @@
 # choice — leaving decisions to the implementer
 
 The specification language's `any x: T where c;` and `#[weakly_specified]`
-(design: [docs/ANY.md](../../docs/ANY.md)). Five functions:
+(see the [language tour](../../docs/LANGUAGE_TOUR.md)). Five functions:
 
 - `checked_div`: a top-level choice — the error message on division by
   zero, any string of at least 10 characters.

@@ -1,197 +1,156 @@
 # rust-djinn
 
-**Write what your program must compute. Let an LLM figure out how.**
+rust-djinn lets you specify a Rust function by describing how its inputs and
+outputs relate. A coding agent writes an implementation and Lean proofs that
+the implementation satisfies those constraints. The verifier checks the proofs;
+the rest of your program calls the resulting function like ordinary Rust.
 
-[Blog post](https://henniger.dev/post/djinn)
-
-rust-djinn is a specification language that is also a programming language.
-Djinn functions consist of *constraints*: they relate function inputs to
-outputs. An LLM writes the code
-that finds that output, and it must also hand over a machine-checked proof
-that its code meets the specification. Every Djinn function must be
-specified unambiguously: an LLM must prove that every implementation
-of the specification must have the same outputs given the same inputs.
-
-rust-djinn's main design goal is ease of use. You do not ever need to read
-Lean or Aeneas code, or figure out how to judge whether it is correct. You
-just type `cargo djinn verify` and our tooling handles it for you.
-The unambiguity constraint means you do not need to be overly worried about
-having the LLM run wild. Similar to the
-borrow checker, you may end up fighting with it a bit early on, but the
-system tries to give you counterexamples and clear error messages.
-And you should never feel like you need to write your whole program in Djinn:
-you can freely mix and match Djinn functions with traditional Rust functions.
-Use Djinn wherever it is useful and then write the rest in Rust.
-
-You can use the Djinn to optimize code. While you specify everything about
-how inputs relate to outputs, the Djinn chooses algorithms and figures out
-all the other little details that determine performance. Faster code can
-be just a `cargo djinn optimize` away.
-
-The idea and the first implementation (on Dafny) are described in the paper:
-
-> Simon Henniger, Stephen Chong, Nada Amin. *Djinnlang: Higher-Level
-> Programming by Unambiguous Specification with an LLM in the Compiler.*
-> 2026. [arXiv:2609.23954](https://arxiv.org/abs/2609.23954)
-
-Specifications are `djinn! { … }` blocks in normal Rust crates; you can mix
-them freely with Rust functions. The generated implementations are plain Rust,
-compiled by `rustc`; the proofs are Lean 4 over the [Aeneas](https://github.com/AeneasVerif/aeneas)
-model of that Rust.
-
-- **Install:** [docs/INSTALL.md](docs/INSTALL.md)
-- **First steps:** [docs/FIRST_STEPS.md](docs/FIRST_STEPS.md)
-
-_Note: This is research code and far from production-ready. Use at your own peril._
-
-## What a Djinnlang program looks like
-
-A simple example:
+For example, the maximum of a nonempty list is an element of the list that is
+at least as large as every other element:
 
 ```rust
 use djinn::djinn;
 
 djinn! {
     #[requires(list.len() >= 1)]
-    pub fn max(list: &[i32]) -> r: i32 {
-        r in list;                      // r is one of the elements ...
-        for x in list { x <= r; }       // ... and none of them is larger
+    pub fn maximum(list: &[i32]) -> r: i32 {
+        r in list;
+        for x in list { x <= r; }
     }
 }
 ```
 
-The body contains no executable code. The two statements are a relation between the
-input `list` and the output `r`, and the function is their conjunction. An LLM
-implements the function and proves:
+Here `r` names the result. The body states constraints, not instructions for
+computing it: `for` means that the constraint holds for every element. Both
+clauses matter. Membership alone permits the wrong element; the upper-bound
+constraint alone permits a value larger than every element. Together, they
+specify the maximum without choosing an algorithm.
 
-| Obligation | What it says |
+Writing these constraints is the human's main task. The guides below explain
+how to turn intended behavior into a specification, identify missing cases,
+and use counterexamples to improve it. Djinn functions can live alongside
+ordinary Rust, so you can start with one function.
+
+**This is research software.** The implementation and trusted models are
+experimental. Read [Verification and its limits](#verification-and-its-limits)
+before relying on the guarantees.
+
+## Start here
+
+| Guide | What you will learn |
 |---|---|
-| `max.unambiguous` | any two outputs the statements admit for the same input are equal |
-| `max.exists` | every input that meets the precondition has an output |
-| `max.impl_correct` | the generated Rust returns an output the statements admit, terminates, and never panics |
-| `max.ens_0` | each `#[ensures]` clause follows from the statements, so callers may rely on it |
+| [Onboarding](docs/FIRST_STEPS.md) | Run an example, repair an ambiguous specification, and create your first crate |
+| [Writing specifications](docs/WRITING_SPECS.md) | Derive constraints from requirements, handle edge cases, and decide whether the result is fully specified |
+| [Language tour](docs/LANGUAGE_TOUR.md) | Express constraints, reusable relations, data types, mutation, and deliberate choices |
+| [Installation](docs/INSTALL.md) | Set up the tools needed for each stage, plus optional editor integration |
+| [Documentation and examples](docs/README.md) | Choose an example and find the relevant implementation files |
 
-Note that the first obligation is what makes this a programming language
-rather than a wish list. Because the output is exhaustively specified,
-the LLM gets no say in what the program means. The LLM-generated code never
-needs to be read, and it can be thrown away and regenerated at any time,
-like the output of any other compiler.
+You need Rust and Cargo to try the checked-in `clamp` example. You do not need
+a coding agent or the Lean toolchain for this first run:
 
-## Why
-
-### Shorter code that says what you mean.
-A specification states how inputs relate to outputs: no indices to keep in
-step, no early returns, no helper that exists only because the loop needed
-one. In Rust, a function that finds the start of the line `k` lines before a
-position might be a loop with three exits and a comment explaining the off-by-one;
-in Djinnlang it is three statements: `r` is at most `pos`, `r` is a line
-start, and exactly `k` line terminators lie between `r` and `pos`, or as many
-as there are.
-
-Specifications-as-programs also invite a relational style that makes many
-programs even shorter. If two functions must round-trip, it is enough to
-write one of them and define the other as its preimage: a parser is "the
-input whose printing is this string", and the unambiguity proof then
-doubles as a proof that the printer is injective. So even where specifying
-sounds a lot like programming, the effort is usually lower.
-
-### Constraints help you avoid bugs.
-The first draft of a specification contains bugs, just as a program does,
-and many of them are contradictions: one part of your head had one mental
-model, another part another. A program with a contradiction in it fails
-quietly, which is one reason programmers repeat "don't repeat yourself". A
-specification with a contradiction in it cannot be implemented at all, so
-the bug has to be found before anything else happens. With specifications
-the adage becomes *do repeat yourself*: every line is certain knowledge
-about your program, and stating the same fact twice from two angles
-challenges your assumptions for free.
-
-The unambiguity constraint catches most of the rest, and it is surprisingly
-powerful. Forget to say what is in the first cell of an array and the
-specification admits two outputs, so the off-by-one is caught; specify a
-parser and unambiguity means the grammar itself must be unambiguous.
-Section 5.2 of the [paper](https://arxiv.org/abs/2609.23954)
-takes a nasty piece of specification and shows that
-the common mistakes in it never make it past the unambiguity checker. The
-disadvantage: whether your specification is unambiguous is an undecidable
-question. While LLMs are pretty good at finding either a proof or a
-counterexample, they sometimes may not and you are left waiting.
-A compiler that does not terminate is arguably better than one that
-produces broken code, but it is a new kind of problem.
-
-### Hillclimbing performance.
-The LLM gets a lot of leeway on performance and none on anything else.
-Once a specification is proved, optimisation is free of risk: any rewrite
-the verifier accepts means the same thing. `cargo djinn optimize` times a
-workload you name, asks the LLM for a faster implementation, proves it
-again, and keeps it only if it is both verified and faster.
-
-Even in Djinnlang there are different ways to write a function,
-inductively versus iteratively, say. But since you only describe how the
-outputs relate to the inputs, every way of expressing the same function
-is logically equivalent and should have no impact on performance.
-As LLMs get better at optimising heavily while still proving adherence to a
-specification written without the optimisations in mind, this moves toward
-the Platonic ideal of an optimising compiler: you write your function
-somehow and the result is the fastest possible program.
-
-## How it works
-
-```
-spec.rs ──djinn!──▶ Spec.lean, Obligations.lean       (trusted: generated from the spec)
-    │                        ▲
-    ▼                        │ Lean checks
-cargo djinn implement ──▶ solution/mod.rs + Proofs.lean   (untrusted: written by the agent)
-    │
-    ▼
-cargo build   compiles solution/mod.rs only if the verification report matches the spec
+```sh
+git clone https://github.com/shenniger/rust-djinn.git
+cd rust-djinn
+export DJINN_REPO="$PWD"
+printf '3\n-4\n12\n' | cargo run --locked --manifest-path example/clamp/Cargo.toml -- 0 10
 ```
 
-1. The `djinn!` macro parses the specification, checks it, and expands to
-   Rust signatures that the implementation must provide.
-2. `cargo djinn translate` lowers the specification to Lean (`Spec.lean`), runs
-   Charon and Aeneas on the implementation to obtain its Lean model, and
-   generates the obligations.
-3. `cargo djinn implement` runs an agent in a jail with `cargo djinn verify`
-   as a tool: Claude models through Claude Code, or GPT models through Codex,
-   billed to whichever subscription you already have. It writes
-   `solution/mod.rs` and `Proofs.lean` until every obligation checks.
-4. `cargo djinn verify` has Lean check every obligation.
-5. `cargo djinn bench` and `cargo djinn optimize` time a workload and
-   hill-climb on it under the verifier.
-6. `rust-djinn-lsp` shows the proof status after every function in VS Code and
-   Neovim, lints with the smoke-test as you type, and runs the commands.
+After Cargo's build output, the program prints:
 
-rust-djinn keeps Rust's type system and its functions can easily interface
-with Rust.
-
-## This Repository
-
-```
-docs/              INSTALL.md, FIRST_STEPS.md
-rust-djinn/        the tools (Cargo workspace)
-  syntax/            parser, checks, lowering to Lean, emitters
-  macros/            the `djinn! { … }` macro
-  cargo-djinn/       translate | verify | implement | status | smoke-test | bench | optimize
-  lsp/               rust-djinn-lsp
-editors/           VS Code extension, Neovim config, a scripted LSP client
-example/           sort, clamp, sudoku, lz77 (from the paper), strmap, broken (what smoke-test catches)
+```text
+1 negative input(s); clamped to [0, 10]: [3, 0, 10]; smallest: Some(0)
 ```
 
-## Status and limits
+This compiles the supplied implementation using its checked-in verification
+report. It does not rerun the proofs. Continue with [onboarding](docs/FIRST_STEPS.md)
+to inspect the specification and make your first change. The
+[writing workshop](docs/WRITING_SPECS.md) develops a new specification step by step.
 
-_This is research code and mostly vibe-coded. It is not production-ready
-in the least. Use at your own peril._
+## The development workflow
 
-Currently, this can handle safe Rust over integers,
-slices, vectors, strings, structs, enums, `Option` and `Result`, and
-recursion. Calls into other crates need a model in the trusted library. We
-currently have models for parts of `std`, `core`, `alloc` and `memchr` but they
-are mostly vibe-coded and thus untrustworthy.
+You write specifications in `djinn! { … }` blocks inside a Rust crate. The
+agent writes ordinary Rust in `djinn/solution/` and proofs in `djinn/proofs/`.
+Your Rust code calls the functions exposed by the macro.
 
-Because rust-djinn cannot specify performance, it is prone to side-channel
-attacks. It is thus (conceptually) not suitable for cryptography.
+Once the tools are installed, run these commands in your example or application
+crate, which is separate from the repository's `rust-djinn/` tool workspace:
 
-Unambiguity, existence and implementation proofs are written by
-the agent and can fail on hard specifications; the harness reports which
-obligation stopped it and the cost so far.
+```sh
+cargo djinn smoke-test                    # find small counterexamples with Z3
+cargo djinn implement --limit 5           # ask the agent to implement and prove
+cargo djinn status                        # inspect saved results and outstanding obligations
+cargo djinn verify                        # rerun translation, proof checking, and the axiom audit
+cargo build                              # compile the Rust application
+```
+
+`implement` defaults to Codex; `--agent claude` selects Claude Code. It consumes
+agent usage. `--limit` is Djinn's usage-based stop mechanism, not a guarantee
+of an exact provider bill. See [agent setup](docs/INSTALL.md) before running it.
+The other commands above do not invoke a coding agent. Smoke tests are bounded
+searches, so finding no counterexample is not a proof.
+
+After changing a specification, use `implement` to update its implementation
+and proofs. After editing generated Rust or proofs yourself, rerun `verify`.
+The ordinary build gate consults the report and specification dependencies;
+it is not a replacement for fresh verification of modified implementation code.
+
+For performance work, provide a benchmark workload and use `cargo djinn bench`
+and `cargo djinn optimize`. Optimization candidates must pass verification and
+improve the measured workload to be retained. For a fully specified function,
+this preserves the specified result. Functions marked `#[weakly_specified]`
+deliberately leave choices open and need additional review; the
+[language tour](docs/LANGUAGE_TOUR.md) explains that distinction.
+
+## Verification and its limits
+
+For an ordinary, fully specified function, the proof obligations are:
+
+| Obligation | Meaning |
+|---|---|
+| `unambiguous` | Two outputs satisfying the specification for the same valid input are equal |
+| `exists` | Every input satisfying the precondition admits an output |
+| `impl_correct` | Under the precondition, the modeled implementation terminates successfully and returns an output satisfying the specification |
+| `ens_0`, `ens_1`, … | Each optional `#[ensures]` clause follows from the specification |
+
+The generated implementation is translated through Charon and Aeneas into a
+Lean model. Lean checks the proof against that model, and Djinn audits the
+axioms used. A successful verification establishes properties of that model
+under its assumptions, rather than relying on the agent's claim of correctness.
+
+The result still depends on the specification expressing your intent and on
+the trusted components: Djinn's translation and audit, Charon, Aeneas, Lean,
+and the library models. Those models currently include parts of `std`, `core`,
+`alloc`, and `memchr`; their presence is not evidence of an independent audit.
+Ordinary Rust callers must uphold `#[requires]`: the macro does not insert
+runtime precondition checks or verify the whole application.
+
+Current examples cover integer arithmetic, slices, vectors, strings, structs,
+enums, `Option`, `Result`, and recursion, within the subset supported by the
+parser and translation pipeline. Arbitrary Rust syntax and calls into arbitrary
+crates are not supported. Proof search can fail or take a long time even for a
+valid specification. Runtime performance and absence of timing side channels
+are not specified or proved; these guarantees do not establish suitability for
+cryptographic code.
+
+## Repository layout
+
+```text
+docs/                   installation, onboarding, writing workshop, language tour
+example/                specifications, implementations, proofs, and Rust drivers
+rust-djinn/             Cargo workspace containing the library and tools
+  src/                  djinn library entry point
+  syntax/               parser, checks, and lowering to Lean
+  macros/               djinn! macro and build gate
+  cargo-djinn/           verification and agent driver
+  lsp/                  language server
+editors/                VS Code extension and Neovim configuration
+```
+
+For background and the original Dafny implementation, see the
+[blog post](https://henniger.dev/post/djinn) and the paper:
+
+> Simon Henniger, Stephen Chong, Nada Amin. *Djinnlang: Higher-Level
+> Programming by Unambiguous Specification with an LLM in the Compiler.*
+> 2026. [arXiv:2609.23954](https://arxiv.org/abs/2609.23954)
+
+See [LICENSE.txt](LICENSE.txt) for the license.

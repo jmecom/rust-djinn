@@ -16,7 +16,8 @@
 //!
 //! A `fn` expands to a delegation stub `pub fn max(list: &[i32]) -> i32 {
 //! crate::solution::max(list) }`; a `rel` expands to nothing executable.
-//! The constraint language is documented in DESIGN.md. Lean obligations
+//! The constraint language is documented in `docs/LANGUAGE_TOUR.md` in the
+//! repository. Lean obligations
 //! are produced by `cargo djinn`, not by these macros. `func!` and `rel!`
 //! remain as single-item forms.
 pub use djinn_macros::{djinn, func, rel};

@@ -1,35 +1,77 @@
-# First steps
+# First steps with Djinn
 
-This walk-through uses `example/clamp`, a crate with four small verified
-functions and a plain-Rust driver. It assumes the installation in
-[INSTALL.md](INSTALL.md) is done: `cargo djinn --help` prints the commands,
-`cargo djinn verify` in `example/sort` ends with `PASS`, and one of the
-editor plugins is set up.
+Djinn lets you describe a Rust function by the conditions its result must
+satisfy. Your task is to make that description precise: which inputs are
+allowed, what a result means, and what should happen at the boundaries.
+An implementation supplies the algorithm; Lean proofs establish that the
+translated implementation satisfies the written conditions.
 
-Here's what we'll do on our short guide through Djinn: look at what a Djinn
-crate contains and the language it is written in, open it in the editor and
-add a function to it, have that function optimised, and end with the
-command-line reference behind all of it.
+This guide starts with a working example, helps you write and repair a
+small specification, and then shows the implementation and verification
+workflow. You do not need to know Lean to follow it.
 
-## What's in a Djinn crate?
+Complete the Rust-tools section of [Installation](INSTALL.md) first. Running
+the supplied example needs only those tools. Add Z3 for the specification
+exercise; regenerating and checking proofs needs the full Charon, Aeneas,
+and Lean setup. An editor
+extension and an AI agent are optional until their sections below.
+
+The commands assume `DJINN_REPO` points to your checkout, as set in the
+installation guide. Start in the example crate and stay there unless a step
+explicitly changes directories:
 
 ```sh
-cd example/clamp
+cd "$DJINN_REPO/example/clamp"
 ```
 
-```
-Cargo.toml            depends on `djinn`; [package.metadata.djinn] names the spec file and tool paths
-src/spec.rs           the specification: a `djinn! { … }` block, plus plain Rust (the driver)
-src/lib.rs            `mod spec;` and the implementation module, included by path from djinn/
-src/main.rs           reads stdin, calls the driver in spec.rs
-src/bench.rs          a workload, for `cargo djinn bench` and `optimize`
-djinn/solution/mod.rs the implementation: written by the agent, never by you
-djinn/proofs/         a Lean project: Spec, Obligations and Vocab (generated), Code (Aeneas), Proofs (the agent)
-djinn/report.toml     the verification report; `cargo build` reads it
-.djinnscratch/        disposable: jails, job logs, backups, Charon/Aeneas output, the agent's guide
+## Run an existing implementation
+
+The example already includes an implementation, proofs, and a verification
+report. Run its ordinary Rust command-line program without starting an agent:
+
+```sh
+printf '3\n-4\n12\n' | cargo run --quiet -- 0 10
 ```
 
-Djinn functions are specifications. Here's a few:
+The output is:
+
+```text
+1 negative input(s); clamped to [0, 10]: [3, 0, 10]; smallest: Some(0)
+```
+
+The program reads integers from standard input and takes the lower and upper
+bounds as arguments. It counts negative inputs, clamps each input to the
+requested range, and reports the smallest result. These operations call
+functions declared in [`src/spec.rs`](../example/clamp/src/spec.rs).
+
+Inspect the recorded proof status:
+
+```sh
+cargo djinn status
+```
+
+`status` distinguishes missing implementations, draft proofs, locally checked
+proofs, and proofs accepted by the verifier. It does not run the full
+verification pipeline. To check the supplied implementation and proofs on
+your machine, after configuring the full toolchain, run:
+
+```sh
+cargo djinn verify
+```
+
+A successful run ends with:
+
+```text
+PASS: every obligation is proved and the axiom audit is clean.
+```
+
+This invokes local verification tools, not an AI agent. If a tool is missing
+or an example's configured path does not match your installation, follow the
+path configuration and troubleshooting sections in [Installation](INSTALL.md).
+
+## Read the specification
+
+Open `src/spec.rs`. Its first declaration is:
 
 ```rust
 use djinn::djinn;
@@ -42,88 +84,106 @@ djinn! {
         x > hi => r == hi;
         lo <= x <= hi => r == x;
     }
-
-    pub fn count_negative(v: &[i32]) -> r: usize {
-        r == v.iter().filter(|y| y < 0).count();
-    }
-
-    pub fn min(a: i32, b: i32) -> r: i32 {
-        r <= a;
-        r <= b;
-        r == a || r == b;
-    }
-
-    pub fn max(a: i32, b: i32) -> r: i32 {
-        r >= a;
-        r >= b;
-        r == a || r == b;
-    }
 }
 ```
 
-A `fn` has a Rust signature with a named output, and a body of statements.
-Every statement is a constraint on the output, and the body is their
-conjunction: `clamp`'s result lies in the range and equals whichever of
-`x`, `lo`, `hi` the three implications pick. `#[requires]` is a
-precondition; callers must establish it, and the implementation may assume
-it.
+`x`, `lo`, and `hi` are inputs. `r` names the result so the body can describe
+it. The body contains logical constraints, not Rust instructions: `r == lo`
+states an equality; it does not assign a value. Every statement must hold.
+The expression `a => b` means that whenever `a` holds, `b` must also hold.
 
-The `djinn!` macro expands each `fn` into a Rust declaration whose body
-lives in `djinn/solution/mod.rs`, so the rest of the crate calls `clamp(x,
-lo, hi)` like any function. The driver at the bottom of `spec.rs` does
-exactly that:
+For example, with `x = -4`, `lo = 0`, and `hi = 10`, the second constraint
+requires `r = 0`. With `x = 3`, the last constraint requires `r = 3`. The
+first constraint also requires the result to stay inside the range.
+
+Notice how the clauses express the behavior in words: a result is in range;
+a value below the range becomes its lower bound; a value above becomes its
+upper bound; an already valid value stays unchanged. Merely writing
+`lo <= r <= hi;` would leave many answers possible. The remaining clauses
+identify the intended answer in each case. They also cover `x == lo`,
+`x == hi`, and the single-value range `lo == hi`.
+
+`#[requires(lo <= hi)]` states a **precondition**: the guarantee applies only
+when the caller supplies an ordered range. Ordinary Rust callers must check
+or otherwise establish it. Djinn does not insert a runtime assertion for
+this attribute. The example's `run` function, below the macro block, returns
+an error when `lo > hi` before calling `clamp`. This is a design decision:
+the specification excludes reversed ranges rather than defining a result
+for them.
+
+After implementation, the macro exposes an ordinary Rust function that
+delegates to `crate::solution::clamp`. Its Rust signature is effectively:
 
 ```rust
-let negatives = count_negative(&values);
-let clamped: Vec<i32> = values.iter().map(|&x| clamp(x, lo, hi)).collect();
+pub fn clamp(x: i32, lo: i32, hi: i32) -> i32
 ```
 
-The driver is ordinary Rust and is never translated or verified; its one
-duty is to establish preconditions, and you can see it check `lo <= hi`
-before calling `clamp`.
+The named result is part of the specification language; a caller simply
+uses `clamp(x, lo, hi)`. The parser, input validation, and formatting in the
+example driver are ordinary Rust outside the verified entry points.
 
-An LLM must implement each function in normal Rust and prove certain
-obligations about it: that the specification admits one output per input
-(`unambiguous`), and that the implementation produces it, terminates and
-never panics (`impl_correct`). The example ships with that done. The rest
-of this guide adds a function and has it done again.
+## Understand what gets proved
 
-Apart from `func`s, you can also define `rel`s. A `rel` is a named relation:
-a set of constraints you can use inside `fn`s, with the same syntax. It is
-never implemented and owes no unambiguity proof, so it may relate an input
-to many outputs. Think of a `rel` as providing vocabulary you can use in
-Djinn functions.
+For an ordinary deterministic function such as `clamp`, the main proof
+obligations are:
 
+| Obligation | Meaning |
+|---|---|
+| `unambiguous` | For fixed valid inputs, two results satisfying the specification must be equal. This establishes uniqueness, not existence by itself. |
+| `impl_correct` | On inputs satisfying the precondition, the translated implementation terminates successfully and returns a result satisfying the specification. Successful termination excludes a modeled panic. |
+| `exists` | A valid result exists. For implemented functions, Djinn derives this from `impl_correct`. |
+| `wf`, when needed | Partial operations in the specification, such as indexing, are in their domains, and specification calls meet their preconditions. |
 
-## The editor
+The verifier builds the Rust crate, extracts the selected functions with
+Charon, translates them to Lean with Aeneas, regenerates the specification
+and obligations, checks the proofs, and audits their axioms. A `sorry`
+placeholder is not an accepted proof.
 
-Use either VS Code or Neovim (see setup in
-[INSTALL.md](INSTALL.md)). Open the example:
+The guarantee is about the written specification and the translated model.
+You still need to decide whether the specification describes the intended
+behavior and whether callers establish its preconditions. The translation
+tools, supported library models, and proof-checking foundation are part of
+the trust assumptions. A proof for `clamp` does not verify the surrounding
+CLI, all Rust library code, or the whole application. Read the
+[language tour](LANGUAGE_TOUR.md) for the supported language and its limits.
 
-```sh
-code example/clamp                                           # with the extension installed
-nvim -u ../../editors/nvim/djinn.lua src/spec.rs             # the demo configuration
-```
+## Know which files to edit
 
-### The status at every function
+The example separates the specification, the implementation, and the
+evidence used to check it:
 
-After each `fn` and `rel`, you'll see the proof status, taken from the last
-verification and kept current: green `✓ ok`, grey `unverified`,
-`changed since verification` once you edit a function, and red when the
-smoke-test found something. In VS Code it is drawn after the line; in Neovim
-on a dimmed line below. Hover it for the detail.
+| Path, relative to `example/clamp` | Role |
+|---|---|
+| `Cargo.toml` | Authored dependency, specification, tool-path, and benchmark configuration. |
+| `src/spec.rs` | Authored `djinn!` declarations and the ordinary Rust driver beside them. |
+| `src/lib.rs` | Authored module wiring and public exports. |
+| `src/main.rs` | Authored command-line entry point. |
+| `djinn/solution/mod.rs` | Rust implementation, normally written by the agent; inspect it as part of review. |
+| `djinn/proofs/ClampDemo/Proofs.lean` | Proofs, normally written by the agent. Djinn creates and extends the initial skeleton. |
+| `djinn/proofs/ClampDemo/Spec.lean`, `Obligations.lean`, `Vocab.lean`, `Audit.lean` | Generated files; change the specification or generator rather than editing these outputs. |
+| `djinn/proofs/ClampDemo/Code/` | Aeneas-generated Lean model of the Rust code, regenerated during verification. |
+| `djinn/report.toml` | Generated record of the last verification attempt, including failures. |
+| `.djinnscratch/` | Local job logs, agent working directories, generated guide, intermediates, and backups. It is not source material to commit. |
 
-Above the first function, find a row of code lenses: `obligations`, `proofs`,
-`▶ implement`, `verify`, `smoke-test`, `guide`. Every function has its own
-`obligations` and `proofs` lenses, which open the Lean file at that
-function's theorem. Click `obligations` on `clamp` to see what the LLM had
-to prove, and `proofs` to see that it did.
+Keep the specification, implementation, and proofs under version control.
+The examples also commit the generated Lean project and report so their
+state can be inspected and the normal Rust build gate can read the report.
+After making a change, review the relevant generated changes along with
+your authored changes.
 
-![`clamp` in VS Code: the lens row above the function and the green `✓ ok` status after its first line](clamp.png)
+## Write an incomplete specification and diagnose it
 
-### Adding a function
+Suppose you want a function that returns the absolute value of an `i32`.
+Before writing syntax, settle three questions:
 
-Add an absolute value to the block in `src/spec.rs`:
+1. **Inputs:** should every `i32` be accepted? Here, yes: no precondition.
+2. **Result:** what describes an absolute value? It is nonnegative and
+   equals either the input or its negation.
+3. **Boundaries:** can the result type hold every answer? The magnitude of
+   `i32::MIN` is `2147483648`, so use `i64` for the result.
+
+To see what a missing condition looks like, add this deliberately incomplete
+declaration **inside the existing `djinn!` block** in `src/spec.rs`:
 
 ```rust
     pub fn abs(x: i32) -> r: i64 {
@@ -131,27 +191,23 @@ Add an absolute value to the block in `src/spec.rs`:
     }
 ```
 
-Its status reads `unverified`, and a moment after you stop typing it
-turns red, `smoke: ambiguous — x = -1 admits both r = -1 and also r = 1`,
-with a diagnostic on the name:
+Ask the smoke tester to inspect just this declaration:
 
-```
-abs unambiguity: AMBIGUOUS — one of 16 counterexamples within the bounds (inputs in [-8, 8], sequences up to length 4)
-x = -1  admits both  r = -1   and also   r = 1
+```sh
+cargo djinn smoke-test --only abs
 ```
 
-This is the smoke-test, a solver searching small inputs for a contradiction,
-an input with no output, two outputs for one input, or an index out of
-range. It runs on open, on save and while you type, takes seconds, and
-costs nothing. Here it found that two outputs satisfy `r == x || r == -x`
-for every non-zero input; an agent would have found the unambiguity proof
-impossible after some expensive trying. A contradiction is reported
-differently: each of the statements that cannot hold together gets a mark,
-and they are linked in the problems view.
+Expect an `AMBIGUOUS` finding with an input and two distinct permitted
+outputs. The specific counterexample may vary. For example, with `x = -1`,
+both `r = -1` and `r = 1` satisfy the constraint. The declaration says either
+sign is acceptable, but an ordinary `fn` must determine a unique result.
 
-![`abs` in VS Code: the name underlined, and after the line the red status `unverified · smoke: ambiguous — x = -1 admits …`](abs-amb.png)
+Before reading the repair, try the same reasoning for `x = 0` and `x = 5`.
+For zero, both alternatives give the same answer. For five, the declaration
+again permits both signs. A few examples can reveal missing intent even
+before a tool runs.
 
-Add the missing statement and the diagnostic goes away:
+Add the missing nonnegative constraint:
 
 ```rust
     pub fn abs(x: i32) -> r: i64 {
@@ -160,175 +216,250 @@ Add the missing statement and the diagnostic goes away:
     }
 ```
 
-### Having it implemented
+Now run the same smoke test again. Every input has exactly one nonnegative
+magnitude. Each clause has a job: nonnegativity rules out the wrong sign;
+the second clause rules out unrelated nonnegative numbers. Either clause
+alone would be insufficient.
 
-Now run `▶ implement` from the lens row, the palette, or the key (typically
-"<space>di" in Neovim). You'll see the agent's progress where the editor shows
-long-running work (the status bar in VS Code and the status line in Neovim,
-one line per event): `abs: unambiguity proof now passing`, `verify #2:
-PASS`. The status after `abs` changes as obligations get through, and the
-run ends with a one-line message, `djinn implement (codex): PASS — every
-obligation verified`, or the failing line.
+Specification arithmetic uses mathematical values; the eventual Rust
+implementation must still use machine arithmetic safely, for example by
+widening to `i64` before negating. If the result type were `i32`, even the
+repaired constraints would have no representable answer for `i32::MIN`.
+That is a missing result, which is different from having several results.
 
-Implement completes only what is missing, so the four verified functions
-are untouched and the run takes a few minutes: a fraction of a dollar with
-Codex, or a dollar or two with Claude Code. When `abs` is green, `cargo build`
-goes through and the driver can call `abs` like the others. The code
-is in `djinn/solution/mod.rs` if you are curious. No need to read it though!
-Lean has verified it.
+Smoke testing uses Z3 to search for problems within its supported checks
+and bounds. It starts with small integer values and sequences up to length
+4 by default, and repeats suitable checks with full machine integer ranges.
+A clean result is useful feedback, but it is not a proof. Some checks can
+also be skipped or time out; read the individual results. The command does
+not implement the function or produce an accepted verification report.
+Run it explicitly: `implement` and `verify` do not run it for you.
 
-Once the code passes verification, you can compile it as you usually would
-with Rust code, e.g. `cargo build`.
+For more practice turning intended behavior into complete specifications,
+continue with [Writing specifications](WRITING_SPECS.md). The remaining
+sections here explain how to turn a specification into a usable crate.
 
-### Reference: The commands
+## Implement and verify the new function
 
-In VS Code the commands are in the palette under *Djinn:*, on the
-lenses and as chords (`ctrl+alt+d`, then the letter). In Neovim,
-use `<leader>d` (typically `<space>d`) followed by the letter.
+This step is optional if you only want to explore the language. It starts
+an external AI agent and may use paid tokens. Configure and authenticate
+Codex or Claude Code as described in [Installation](INSTALL.md), then choose
+one agent:
 
-| Key | Command |
+```sh
+cargo djinn implement --agent codex --limit 2
+```
+
+Use `--agent claude` instead if that is your configured agent. `--limit 2`
+asks the harness to stop around two US dollars of reported or estimated
+usage. It is not a strict billing cap: pricing estimates and delayed usage
+reports can differ from actual charges. The budget may also be insufficient
+to finish a proof.
+
+The agent receives the specification and generated guide, writes Rust and
+Lean proofs in its working directory, and calls the verifier. The default
+workflow reuses existing implementation and proof work and asks the agent
+to complete or repair what is missing. Existing files can change, so inspect
+the resulting diff. A successful run requires the verifier to accept the
+obligations; an agent's description of success is not the acceptance check.
+
+After it finishes, inspect the status, rerun verification if you have edited
+any code or proofs, and build:
+
+```sh
+cargo djinn status
+cargo djinn verify
+cargo build
+```
+
+The new function is available as `clampdemo::spec::abs`. Add `abs` to the
+`pub use spec::{...};` list in `src/lib.rs` if you also want the shorter
+`clampdemo::abs` path. The existing CLI does not call `abs` automatically.
+
+If the agent stops before verification passes, inspect `status` and the
+verification error, correct a flawed specification if necessary, and run
+`implement` again to continue from the existing work. `cargo djinn guide`
+prints the implementation guide if you want to inspect the obligations or
+work on the Rust and Lean files yourself.
+
+## Use the edit, check, implement, and build loop
+
+For subsequent changes, use this sequence from the crate directory:
+
+1. Edit the specification and its ordinary Rust callers.
+2. Run `cargo djinn smoke-test`, or `--only NAME` for a focused check.
+3. Run `cargo djinn implement --agent codex --limit 2` when implementation
+   or proof work is needed. Alternatively, edit the implementation and
+   proofs yourself.
+4. Run `cargo djinn verify` to check the current files and regenerate the
+   report. Use `cargo djinn status` to interpret incomplete results.
+5. Run `cargo build`, `cargo test`, and the application-level checks that
+   exercise the surrounding unverified Rust code.
+
+The normal macro build gate checks the report's per-function verdicts and
+whether the declaration and its specification dependencies match the
+recorded tokens. A new or changed specification can therefore stop
+`cargo build` with a message asking you to implement or verify it.
+
+This gate is not a fresh proof run, and it does not fingerprint changes to
+the implementation or proof files. Run `verify` after changing either,
+even if `cargo build` succeeds. The verifier bypasses the gate for its own
+intermediate build. Editor integrations also disable it for rust-analyzer,
+and `DJINN_GATE=off` disables it explicitly; such a build is not evidence
+of verification.
+
+These status markers help distinguish the stages:
+
+| Marker or message | Next step |
 |---|---|
-| `i` | implement, with the configured agent |
-| `v` | verify |
-| `s` | smoke-test |
-| `o` | open the obligations of the function under the cursor |
-| `p` | open its proofs |
-| `g` | open the agent's guide |
-| `S` | status |
+| Missing implementation or proof | Run `implement`, or supply the missing Rust or Lean code. |
+| `~` / drafted | Resolve the proof errors or remaining `sorry` placeholders. |
+| `✓·` / checks locally | Run full `verify`; a local proof check is not full acceptance. |
+| `✓?` / changed since verification | Re-run `verify`, then repair implementation or proofs if needed. |
+| `✓` / accepted by verify | Check that verification is fresh for the files you intend to use. |
 
-## Measuring and optimising
+## Start a crate of your own
 
-Let's now optimize for performance!
-
-First, we measure. For this purpose, `clamp` has a built-in benchmark test set.
-Read it in `src/bench.rs` if you are curious.
-Run from a shell in `example/clamp`:
-
-```sh
-cargo djinn bench
-```
-
-```
-== bench: 5.72 µs per iteration (median of 5 batches × 39320 iterations; spread 2.3%)
-```
-
-Then we ask an agent to optimize:
+This section creates a separate library next to the checkout. You can create
+the files with the Rust tools and check the specification after adding Z3.
+Before generating its proof project or implementation, complete the full
+verification setup from [Installation](INSTALL.md), including the absolute
+`DJINN_CHARON`, `DJINN_AENEAS`, and `DJINN_AENEAS_LEAN` paths. No editor
+integration is required.
 
 ```sh
-cargo djinn optimize --cycles 2 --limit 5 --agent codex
+cargo new --lib "$DJINN_REPO/../djinn-tutorial" --edition 2021
+cd "$DJINN_REPO/../djinn-tutorial"
+cargo add djinn --path "$DJINN_REPO/rust-djinn"
 ```
 
-Each cycle asks the agent for a faster implementation, re-verifies it, and
-keeps it only if it is both proved and faster than the last accepted one.
-Anything else is reverted, as is a run you interrupt. The `optimize:` line
-in `status` records the result: on this crate, `count_negative` went from
-15.92 µs to 5.74 µs over the workload.
+The dependency is the `rust-djinn/` package inside the repository, not the
+repository root. Append this configuration to the new `Cargo.toml`:
 
-### Leaving a choice to the implementer: `any`
+```toml
+[package.metadata.charon]
+preset = "aeneas"
 
-Normally every `fn` is unambiguous: you decide *what* is computed and the
-agent only decides *how*. `any x: T where c;` gives up part of that control
-on purpose. `x` becomes a value the agent picks, constrained only by `c`.
-For example, a search that may return any position of `x`, not necessarily
-the first, which leaves the agent free to search from the back, in chunks,
-or by bisection:
+[package.metadata.djinn]
+spec = "src/spec.rs"
+namespace = "Tutorial"
+```
+
+`spec` is relative to the new crate. `namespace` names its generated Lean
+namespace. Since this crate does not set `charon`, `aeneas`, or
+`aeneas_lean` in its manifest, it uses your environment configuration.
+
+Replace `src/lib.rs` with:
 
 ```rust
+pub mod spec;
+
+#[forbid(unsafe_code)]
+#[path = "../djinn/solution/mod.rs"]
+pub mod solution;
+
+pub use spec::abs;
+```
+
+The `solution` module must exist at the crate root because the macro calls
+`crate::solution::abs`. The path is relative to `src/lib.rs`. The
+`#[forbid(unsafe_code)]` attribute is required by the verifier unless unsafe
+code is already forbidden for the whole crate.
+
+Create `src/spec.rs`:
+
+```rust
+use djinn::djinn;
+
 djinn! {
-    // Some position of x in v: which one, if there are several, is the implementer's choice.
-    #[weakly_specified]
-    #[requires(x in v)]
-    #[ensures(v[i] == x)]
-    pub fn find(v: &[i32], x: i32) -> i: usize {
-        any j: usize where j < v.len() && v[j] == x;
-        i == j;
+    pub fn abs(x: i32) -> r: i64 {
+        r >= 0;
+        r == x || r == -x;
     }
 }
 ```
 
-The proof still covers everything you wrote: `find` returns a position that
-holds `x`, never panics and terminates, and every `ensures` must hold for
-*every* choice the `where` allows. But the LLM decides what you left open.
-**Use `any` only very sparingly and with great care:**
+Check the specification without starting an agent:
 
-- **Specify carefully.** The `where` clause is your entire guarantee about
-  the choice. Forget a constraint and the agent may legally pick something
-  you did not want. Drop `v[j] == x` here and any index in range qualifies.
-- **Check the code by hand.** `#[weakly_specified]` is required on the `fn`
-  and on every `fn` that calls it, and `status` marks each of them "review
-  the choices". A human should read all functions that carry this attribute.
-- **Know when to use it.** A free choice pays off only if something pushes it
-  in a good direction. Usually that is `cargo djinn optimize` with a workload
-  that measures what you care about: here, the speed of `find` on your
-  data. If you just don't want to type out some trivial detail (e.g. an
-  error message), it is almost always a better choice to have an agent help
-  you with writing the spec instead of using `any`. That way, what the agent
-  chose stays constant across implementation cycles and it is easier to check.
+```sh
+cargo djinn smoke-test
+```
 
-The full semantics, including choices inside `for` loops and in callers, are
-in [ANY.md](ANY.md). `example/choice` and the compression levels of
-`example/gzip` use `any`.
+Once the full verification toolchain is configured, generate its initial
+project files:
 
-## Reference: The command line
+```sh
+cargo djinn translate
+cargo djinn status
+```
 
-Everything the editor does is a `cargo djinn` subcommand, run in the crate
-directory (or with `--manifest-path`). The ones you will use:
+`translate` creates the missing `djinn/solution/mod.rs`, the Lean project
+under `djinn/proofs/`, and proof stubs. It does not implement or prove
+`abs`. A normal `cargo build` should still be rejected at this stage.
 
-| Command | What it does |
+When you are ready to run an agent, use the same explicit implementation
+step and check its result:
+
+```sh
+cargo djinn implement --agent codex --limit 2
+cargo djinn verify
+cargo build
+```
+
+After verification passes, ordinary Rust can call
+`djinn_tutorial::abs(i32::MIN)` and receive `2147483648_i64`. For an
+application-level exercise, add a binary or test that calls the function
+with negative, zero, positive, and minimum `i32` inputs.
+
+## Resolve common failures
+
+| Symptom | What to check |
 |---|---|
-| `cargo djinn status` | one line per function with its obligations, then the agent runs on this crate with their token use and cost |
-| `cargo djinn smoke-test [--only NAME]` | the Z3 checks the editor runs as you type, with every counterexample; `example/broken` shows each kind of finding |
-| `cargo djinn implement [--agent codex\|claude] [--limit USD]` | runs the agent until every obligation checks; reuses what already passes, `-B` starts over, `--background` returns at once and `status` follows the job |
-| `cargo djinn verify` | the whole chain: `cargo build`, Charon, Aeneas, the Lean build, the axiom audit; every run writes `djinn/report.toml` |
-| `cargo djinn translate` | regenerates the Lean specification, obligations and the agent's guide without verifying |
-| `cargo djinn bench` / `optimize` | see above |
-| `cargo djinn clean [--list \| --restore [ID]]` | sets the implementation and proofs aside under `.djinnscratch/backup/`, lists the backups, or brings one back and verifies it |
-| `cargo djinn guide` | prints the guide the agent is given |
+| `no such command: djinn` | The CLI binary must be installed or its build directory must be on `PATH`; see [Installation](INSTALL.md). |
+| `Cargo.toml` cannot be read | Run in the crate directory, or supply `--manifest-path /path/to/crate/Cargo.toml`. The repository root is not the example crate. |
+| `cannot run z3` | Install Z3 and put it on `PATH`. Smoke testing does not require an agent. |
+| `AMBIGUOUS` or a contradiction | Read the reported inputs and constraints. Repair the specification before trying to prove it. |
+| Missing `solution/mod.rs` | Check the module path and run `cargo djinn translate` to create the scaffold. |
+| `changed since it was verified` | Re-run `verify`; if the old implementation no longer satisfies the new specification, run `implement` or repair it yourself. |
+| Charon, Aeneas, or Lake fails | Inspect the named failing stage and the tool paths. Manifest settings override environment variables; the examples contain explicit paths. |
+| Unsupported external function | Keep I/O and formatting in ordinary Rust drivers; use operations supported by the translation and library models in verified code. |
+| `sorry`, missing theorem, or axiom-audit failure | The proof is incomplete or relies on a disallowed assumption. A successful Rust build or Lean file build alone is insufficient. |
+| Agent exits without `PASS` | Read `status`, `djinn/report.toml`, and the agent logs under `.djinnscratch/jails/`; a budget or process exit is not proof completion. |
 
-`status` is the one to remember:
+Run `cargo djinn verify` directly to reproduce the failing verification
+stage without starting another agent. `cargo djinn clean --list` lists
+available backups; `clean` without that flag archives and removes current
+implementation and proof artifacts, so it is not a routine prerequisite.
 
+## Optional editor and performance workflows
+
+The [editor integrations](../editors/README.md) expose status, smoke tests,
+implementation, verification, and navigation to generated obligations and
+proofs. They supplement the same CLI workflow. You can finish this tutorial
+with any editor.
+
+To experiment with performance, return to the supplied clamp crate, whose
+manifest defines a benchmark workload:
+
+```sh
+cd "$DJINN_REPO/example/clamp"
+cargo djinn bench
 ```
-  func clamp            unambiguous ✓   impl drafted   impl_correct ✓   [exists ✓]   → ok
-  func abs              unambiguous ✓?  impl drafted   impl_correct ✓?  [exists ✓?]   → CHANGED since verification — re-run verify
-  funcs implemented and fully verified: 4/5
+
+If you want an agent to search for a faster implementation, this command
+also starts a potentially paid run:
+
+```sh
+cargo djinn optimize --cycles 2 --limit 2 --agent codex
 ```
 
-And `cargo build` compiles. A function without a verification that
-matches its current text is a compile error until `implement` or `verify`
-has passed again:
+The optimizer verifies candidate implementations and measures the
+configured workload before accepting an improvement. Performance is
+specific to that workload and machine; benchmark results are not part of
+the functional specification. Start with correct, useful specifications
+and measurements before optimizing.
 
-```
-error: djinn func `abs` was never attempted (not in djinn/report.toml); run `cargo djinn implement`
-```
-
-The editor plugins turn the gate off for rust-analyzer with
-`DJINN_GATE=off`, which is why you could keep editing earlier; `cargo build`
-always enforces it.
-
-## Reference: The language in brief
-
-The bodies constrain the output. The forms you will use first:
-
-| Form | Meaning |
-|---|---|
-| `r == e;`  `lo <= r <= hi;` | equality, chained comparisons |
-| `cond => stmt;` | the statement holds when the condition does |
-| `if c { … } else { … }` | both branches are statements |
-| `for x in list { … }`  `for i in 0..n { … }` | the body holds for every element or index |
-| `x in list`  `x not in list` | membership |
-| `some k: int { … }` | there is a `k` for which the statements hold (an unnamed intermediate) |
-| `match e { Pat(a) => { … } _ => { false; } }` | case analysis on an enum or `Option` |
-| `v.iter().filter(\|y\| y < 0).count()` | the Rust idioms the verifier knows models for |
-| `old(v)` | the entry value of a `&mut` parameter |
-| `#[requires(…)]` `#[ensures(…)]` | precondition; a consequence exported to callers and proved from the body |
-| `pub rel name(…) -> r: T { … }` | a relation: used by `fn`s, never implemented, may be ambiguous |
-| `#[decreases(e)]` `#[total]` | termination measure of a recursive `rel`; ask for its existence proof |
-| `#[override_smoke_test]` | skip the smoke-test for this declaration, when its bounded search cannot reach it (a 288-element table, say) |
-| `any x: T where c;` | a value the implementer chooses, within `c` — in a `fn` marked `#[weakly_specified]` (see [ANY.md](ANY.md)) |
-| `#[weakly_specified]` | required on every `fn` that has an `any` or calls one that does: the implementer's choices are reviewed by a human |
-
-Arguments of a `fn` are Rust types; a `rel` may additionally take `int`, the
-mathematical integers, for indices and counts.
-
-# Examples
-Find more examples in [../example](../example).
+Continue with [Writing specifications](WRITING_SPECS.md) to practice deciding
+what a function should guarantee. Use the [language tour](LANGUAGE_TOUR.md)
+for syntax and semantics, and the [example programs](../example) for larger
+specifications.

@@ -7,7 +7,7 @@ agents in `djinn/solution/mod.rs`, each with a Lean proof in `djinn/proofs/`:
 | Function | Specification |
 |---|---|
 | `decompress(s) -> Option<Vec<u8>>` | `Some(content)` exactly when `s` is one gzip member (any header flags, matching CRC-32 and length) |
-| `compress(data, level) -> Vec<u8>` | the gzip header for `level`, followed by *any* member that `decompress` reads back as `data` (`any`, see [docs/ANY.md](../../docs/ANY.md)); `ensures(decompress(out) == Some(data))` |
+| `compress(data, level) -> Vec<u8>` | the gzip header for `level`, followed by *any* member that `decompress` reads back as `data` (`any`, see the [language tour](../../docs/LANGUAGE_TOUR.md)); `ensures(decompress(out) == Some(data))` |
 | `crc32(data) -> u32` | the CRC-32 of RFC 1952 |
 
 `cargo djinn status`: 3/3 functions implemented and fully verified, axiom audit clean.
