@@ -151,6 +151,8 @@ impl Report {
         for (d, ok) in self.declarations.iter_mut().zip(oks) {
             d.ok = ok;
         }
+        self.pass &= self.declarations.iter().all(|d| d.ok)
+            && self.obligations.values().all(|status| status == "proved");
     }
     pub fn save(&self, cfg: &Config) {
         let _ = fs::create_dir_all(cfg.state_dir());
@@ -849,20 +851,6 @@ fn run(cmd: &mut Command, what: &str, log: &mut Log) -> Result<String, String> {
     Ok(text)
 }
 
-fn noise(line: &str) -> bool {
-    line.starts_with('⚠')
-        || line.contains("linter")
-        || line.starts_with("Note:")
-        || line.trim().is_empty()
-        || line.contains("unusedVariables")
-        || line.contains("binding can be removed")
-        || line.contains("not explicitly referenced")
-        || line.contains("dupNamespace")
-        || line.contains("duplicated in the declaration")
-        || line.starts_with("trace:")
-        || line.starts_with("  • ")
-}
-
 /// The whole gate. With `jail`, the LLM-owned files are first synced back
 /// from the jail into the crate, and the trusted files are pushed to the jail
 /// afterwards.
@@ -883,8 +871,17 @@ pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
     match result {
         Ok(()) => {
             report.pass = true;
-            report.stage = "done".into();
-            log.line("PASS");
+            report.finalize();
+            if report.pass {
+                report.stage = "done".into();
+                log.line("PASS");
+            } else {
+                report.stage = "incomplete".into();
+                let missing: Vec<_> = report.declarations.iter().filter(|d| !d.ok).map(|d| d.name.as_str()).collect();
+                let message = format!("FAIL: verification is incomplete; declarations without a verified implementation or complete proofs: {}", missing.join(", "));
+                log.line(&message);
+                report.errors.push(message);
+            }
         }
         Err((stage, msg)) => {
             report.pass = false;
@@ -998,6 +995,21 @@ fn aeneas_pipeline_bound(cfg: &Config, log: &mut Log) -> Result<djinn_syntax::ce
             Err(uncovered) => return Err(stage("externals", explain_externals(cfg, &uncovered))),
         }
     }
+    // Aeneas's string-literal helper defaults to `decide +native`, which
+    // introduces an axiom. Keep the same conversion and discharge its size
+    // premise in the kernel. The local syntax does not affect imported proofs.
+    let funs = code_dir.join("Funs.lean");
+    if funs.is_file() {
+        let text = fs::read_to_string(&funs).map_err(|e| stage("aeneas", e.to_string()))?;
+        if text.contains("toStr") {
+            let namespace = format!("namespace {}\n", cfg.ns);
+            if !text.contains(&namespace) {
+                return Err(stage("aeneas", "cannot locate generated namespace for string-literal proof".into()));
+            }
+            let kernel_literal = "local macro \"toStr\" s:str : term => `(Aeneas.Std.toStr $s (by rw [Aeneas.Std.U32.max_eq]; decide +kernel))\n";
+            fs::write(&funs, text.replacen(&namespace, &format!("{namespace}\n{kernel_literal}"), 1)).map_err(|e| stage("aeneas", e.to_string()))?;
+        }
+    }
     Ok(certificate)
 }
 
@@ -1094,58 +1106,24 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
     }
     // 1–4. Build and extract the exact source captured before Charon.
     let certificate = aeneas_pipeline_bound(cfg, log)?;
-    // 5. regenerate the trusted files
-    translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
-    report.declarations = decl_statuses(cfg, &lowered, &impl_names(cfg));
-    // 6. lake build
-    match run(Command::new("lake").arg("build").current_dir(&cfg.proofs), "lake build", log) {
-        Ok(text) => {
-            if text.contains("declaration uses 'sorry'") || text.contains("declaration uses `sorry`") {
-                log.line("note: proofs still contain sorry (the axiom audit will reject them)");
-            }
-        }
-        Err(e) => {
-            report.errors = e.lines().filter(|l| l.starts_with("error:") && !noise(l)).map(|s| s.to_string()).collect();
-            for o in report.obligations.values_mut() {
-                *o = "error".into();
-            }
-            return Err(stage("lake build", e));
-        }
+    // 5. Regenerate trusted specifications and expected obligation types.
+    let lowered = translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
+    let names = impl_names(cfg);
+    report.declarations = decl_statuses(cfg, &lowered, &names);
+    report.obligations.clear();
+    for declaration in &report.declarations {
+        for name in &declaration.obligations { report.obligations.insert(name.clone(), "unverified".into()); }
     }
-    // 7. axiom audit
-    let audit = run(
-        Command::new("lake").args(["env", "lean"]).arg(format!("{}/Audit.lean", cfg.ns)).current_dir(&cfg.proofs),
-        "axiom audit",
-        log,
-    )
-    .map_err(|e| stage("axiom audit", e))?;
-    let allowed = ["propext", "Classical.choice", "Quot.sound"];
-    let prefix = format!("{}.Obligations.", cfg.ns);
-    let mut bad = Vec::new();
-    for line in audit.lines() {
-        let name_of = |l: &str| l.trim_start_matches('\'').split('\'').next().unwrap_or("").trim_start_matches(&prefix).to_string();
-        if line.contains("does not depend on any axioms") {
-            report.obligations.insert(name_of(line), "proved".into());
-            continue;
-        }
-        if let Some((name, rest)) = line.split_once("depends on axioms:") {
-            let axioms: Vec<&str> = rest.trim().trim_start_matches('[').trim_end_matches(']').split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            let extra: Vec<&str> = axioms.iter().copied().filter(|a| !allowed.contains(a)).collect();
-            let n = name_of(name);
-            if extra.is_empty() {
-                report.obligations.insert(n, "proved".into());
-            } else {
-                let status = if extra.contains(&"sorryAx") { "sorry".to_string() } else { format!("axiom:{}", extra.join(",")) };
-                report.obligations.insert(n.clone(), status);
-                bad.push(format!("{n} uses {}", extra.join(", ")));
-            }
-        } else if line.contains("error") {
-            bad.push(line.to_string());
-        }
-    }
-    if !bad.is_empty() {
-        return Err(stage("axiom audit", format!("FAIL: axiom audit\n  {}", bad.join("\n  "))));
-    }
+    let prog = parse_spec(cfg).map_err(|e| stage("specification", e))?;
+    let tn = type_names(cfg, &prog);
+    let cx = emit_cx(cfg, &lowered, &names, &tn);
+    // 6–7. Candidate elaboration has read-only inputs and isolated outputs.
+    // The checker subsequently reads declarations as inert data and replays
+    // them through the kernel; no candidate command can report audit success.
+    let audited = crate::proof_check::check(cfg, &cx, &lowered, log).map_err(|e| stage("isolated proof check", e))?;
+    let bad: Vec<_> = audited.iter().filter(|(_, status)| status.as_str() != "proved").map(|(name, status)| format!("{name}: {status}")).collect();
+    report.obligations = audited;
+    if !bad.is_empty() { return Err(stage("axiom audit", format!("FAIL: axiom audit\n  {}", bad.join("\n  ")))); }
     // Concurrent edits, build scripts and other pipeline side effects must not
     // turn a proof of the extracted program into a certificate for another one.
     let after = djinn_syntax::certificate::capture(&cfg.crate_dir).map_err(|e| stage("source snapshot", e))?;

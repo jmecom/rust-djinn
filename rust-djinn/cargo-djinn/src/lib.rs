@@ -9,6 +9,7 @@ pub mod jail;
 pub mod mcp;
 pub mod models;
 pub mod optimize;
+mod proof_check;
 pub mod smoke;
 pub mod status;
 pub mod verify;

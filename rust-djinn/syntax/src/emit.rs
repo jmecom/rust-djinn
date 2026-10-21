@@ -369,8 +369,9 @@ pub fn obligations_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
     s.push_str("    Each theorem below is PINNED by its type and takes its proof from\n");
     s.push_str(&format!("    `{}.Proofs` by name. The implementer may prove it any way, with any\n", cx.ns));
     s.push_str("    helpers, but cannot weaken it: if the type does not match, this file fails\n");
-    s.push_str("    to elaborate. `Audit.lean` then checks `#print axioms` of every theorem\n");
-    s.push_str("    here against {propext, Classical.choice, Quot.sound}. -/\n");
+    s.push_str("    to elaborate. The driver independently pins these types, replays the\n");
+    s.push_str("    kernel declarations, and checks their axiom closure. Audit.lean is only\n");
+    s.push_str("    a human-readable diagnostic, never the verification authority. -/\n");
     s.push_str(&format!("import {0}.Spec\n{1}import {0}.Proofs\n\nopen Aeneas Std\nopen {0}.Spec\n\nnamespace {0}.Obligations\n\n", cx.ns, code_import(cx)));
     for d in decls {
         s.push_str(&format!("/-! ### {}  ({}{}) -/\n\n", d.name, d.kind.word(), if d.total { ", total" } else { "" }));
@@ -411,8 +412,9 @@ pub fn proofs_skeleton(cx: &EmitCx, decls: &[Lowered]) -> String {
 
 pub fn audit_lean(cx: &EmitCx, decls: &[Lowered]) -> String {
     let mut s = String::new();
-    s.push_str("/-  Audit.lean — generated; `cargo djinn verify` runs it and accepts only\n");
-    s.push_str("    propext, Classical.choice and Quot.sound. -/\n");
+    s.push_str("/-  Audit.lean — generated human-readable diagnostics. The driver does not\n");
+    s.push_str("    execute or trust this output; its isolated checker audits kernel data.\n");
+    s.push_str("    Accepted axioms: propext, Classical.choice and Quot.sound. -/\n");
     s.push_str(&format!("import {}.Obligations\n\n", cx.ns));
     for d in decls {
         for o in obligations(cx, d) {

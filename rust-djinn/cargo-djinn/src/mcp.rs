@@ -13,7 +13,7 @@ fn tools() -> Value {
             "name": "verify",
             "description": "Run the Djinn verifier on your current solution and proofs: syncs the solution directory and Proofs.lean from this jail into the real crate, then cargo build → charon → aeneas → regenerate trusted Lean → lake build → axiom audit. Returns PASS or the failing stage with the errors. Also refreshes the generated files in the jail (Code/, Spec.lean, Obligations.lean). Takes 10 s to a few minutes.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
-            "annotations": { "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false }
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false }
         },
         {
             "name": "status",

@@ -144,7 +144,7 @@ spec.rs ──djinn!──▶ Spec.lean, Obligations.lean       (trusted: genera
 cargo djinn implement ──▶ solution/mod.rs + Proofs.lean   (untrusted: written by the agent)
     │
     ▼
-cargo build   compiles solution/mod.rs only if the verification report matches the spec
+cargo build   compiles solution/mod.rs only if its certificate matches the verified inputs
 ```
 
 1. The `djinn!` macro parses the specification, checks it, and expands to
@@ -156,7 +156,10 @@ cargo build   compiles solution/mod.rs only if the verification report matches t
    as a tool: Claude models through Claude Code, or GPT models through Codex,
    billed to whichever subscription you already have. It writes
    `solution/mod.rs` and `Proofs.lean` until every obligation checks.
-4. `cargo djinn verify` has Lean check every obligation.
+4. `cargo djinn verify` compiles proofs in an OS sandbox, rechecks their
+   declarations through Lean's kernel, and checks their exact expected types
+   and axiom dependencies. Its certificate binds the supported source and
+   build inputs; changing an implementation requires verification again.
 5. `cargo djinn bench` and `cargo djinn optimize` time a workload and
    hill-climb on it under the verifier.
 6. `rust-djinn-lsp` shows the proof status after every function in VS Code and
@@ -188,6 +191,11 @@ slices, vectors, strings, structs, enums, `Option` and `Result`, and
 recursion. Calls into other crates need a model in the trusted library. We
 currently have models for parts of `std`, `core`, `alloc` and `memchr` but they
 are mostly vibe-coded and thus untrustworthy.
+
+Verification currently requires macOS `sandbox-exec` or Linux `bubblewrap`
+and a configured, built Aeneas Lean backend. Certificates reject unsupported
+source and build inputs; see [verification requirements](docs/INSTALL.md#verification-requirements)
+for source and model restrictions.
 
 Because rust-djinn cannot specify performance, it is prone to side-channel
 attacks. It is thus (conceptually) not suitable for cryptography.

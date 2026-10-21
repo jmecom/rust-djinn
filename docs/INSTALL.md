@@ -57,9 +57,11 @@ binaries in `src/bin/` aside), in as many files as you like. To name the
 files yourself instead, say `spec = "src/spec.rs"` or
 `spec = ["src/spec.rs", "src/lz77.rs"]`.
 
-The examples under `example/` are set up this way and are the quickest check
-that part 1 worked: `cd example/clamp && cargo build` compiles, because the
-example ships verified and its verification report is in place.
+The examples under `example/` are set up this way. After configuring the
+verification toolchain below, run `cargo djinn verify` in `example/clamp`,
+then `cargo build`. Certificates must match the current source, target,
+configuration, and local dependencies; legacy reports are not accepted.
+Existing example proofs may need updates for corrected lowering and kernel checks.
 
 ## 2. Aeneas and the other dependencies
 
@@ -147,6 +149,34 @@ brew install z3            # macOS
 sudo apt install z3        # Debian and Ubuntu
 ```
 
+### Verification requirements
+
+Untrusted Lean proofs are compiled with read-only source and dependency
+snapshots and a separate writable output directory. Verification requires
+`sandbox-exec` on macOS, or `bubblewrap` with user namespaces available on
+Linux (`sudo apt install bubblewrap` on Debian/Ubuntu). It fails if the
+sandbox cannot start. Other operating systems are currently unsupported
+for proof verification.
+
+The configured Aeneas backend and installed Lean toolchain are trusted
+inputs. Build that backend before verification. The verifier does not
+execute a project's Lake configuration or reuse its compiled proof objects.
+
+Reports are trusted artifacts, not signatures. They bind source, implementations,
+manifests, lockfiles, configuration, and local dependencies. The verifier and
+Djinn library must use the same source checkout; status does not execute proofs.
+
+Certification rejects build scripts, runtime registry/git dependencies,
+optional or feature-dependent dependencies, custom procedural macros,
+environment/location macros, source `include!`, and non-test conditional
+compilation. Literal data includes are supported; local `macro_rules!` helpers
+are limited to expression fragments. Source symlinks and paths into excluded
+build directories are rejected.
+
+HashMap models support integer keys, identical query types, `RandomState`, and
+the global allocator. Direct hashing, custom callbacks, and local crates named
+`core`, `alloc`, `std`, or `memchr` are rejected to preserve model assumptions.
+
 ### Telling the tools where things are
 
 Each crate names its tool paths in `Cargo.toml`, relative to the crate
@@ -175,12 +205,13 @@ cd example/sort
 cargo djinn verify
 ```
 
-The run prints its stages, `== cargo build`, `== charon`, `== aeneas`,
-`== lake build`, `== axiom audit`, and ends with `PASS`. The first verify of
-any crate compiles the Lean project and takes a minute or two; later runs
-take about twenty seconds. If `charon` or `aeneas` is reported missing, the
-paths in the previous step are wrong; if `lake` complains about Mathlib,
-the shared cache was not created or `lake exe cache get` did not run.
+The run builds Rust, extracts its model through Charon and Aeneas, then
+performs an isolated Lean build and kernel audit. `PASS` requires every
+function to be implemented, every expected obligation to be proved, and
+the source snapshot to remain unchanged. Proofs are compiled afresh;
+verification time depends on their size. If `charon` or `aeneas` is missing,
+check the configured paths. A missing Lean dependency means the trusted
+Aeneas backend needs `lake exe cache get` and `lake build`.
 
 ## 3. An agent
 
