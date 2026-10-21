@@ -3,6 +3,7 @@
 
 pub mod ast;
 pub mod check;
+pub mod certificate;
 pub mod emit;
 pub mod lower;
 pub mod parse;
@@ -80,6 +81,7 @@ pub fn parse_sources(srcs: &[String]) -> Result<Program> {
         all.types.enums.extend(types.enums);
         all.types.structs.extend(types.structs);
         all.types.consts.extend(types.consts);
+        all.types.sources.extend(types.sources);
         for (n, r) in types.ambient_errors {
             all.types.ambient_errors.entry(n).or_insert(r);
         }

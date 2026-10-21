@@ -563,6 +563,8 @@ impl Method {
 /// its Aeneas translation.
 #[derive(Clone, Debug, Default)]
 pub struct TypeDefs {
+    /// Canonical source of types and constants, for report freshness.
+    pub sources: std::collections::HashMap<String, String>,
     pub enums: std::collections::HashMap<String, EnumDef>,
     pub structs: std::collections::HashMap<String, StructDef>,
     pub consts: std::collections::HashMap<String, Const>,

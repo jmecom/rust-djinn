@@ -64,6 +64,8 @@ pub fn solution_fns(cfg: &Config) -> Vec<String> {
 struct ReportFile {
     run: RunEntry,
     #[serde(default)]
+    certificate: Option<djinn_syntax::certificate::Certificate>,
+    #[serde(default)]
     decl: Vec<DeclEntry>,
 }
 
@@ -94,6 +96,9 @@ struct DeclEntry {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Report {
+    /// Exact local inputs certified by this run; old reports are deliberately stale.
+    #[serde(default)]
+    pub certificate: Option<djinn_syntax::certificate::Certificate>,
     pub time: u64,
     pub duration_secs: u64,
     pub pass: bool,
@@ -130,7 +135,7 @@ impl Report {
             declarations.push(DeclStatus { name: d.name, kind: d.kind, implemented: d.implemented, obligations: names, tokens: d.tokens, uses: d.uses, ok: d.ok, weak: d.weakly_specified });
         }
         let log_tail = fs::read_to_string(Report::log_path(cfg)).map(|t| t.lines().map(|s| s.to_string()).collect()).unwrap_or_default();
-        Some(Report { time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail })
+        Some(Report { certificate: f.certificate, time: f.run.unix_time, duration_secs: f.run.duration_secs, pass: f.run.pass, stage: f.run.stage, obligations, declarations, errors: f.run.errors, log_tail })
     }
     /// Decide `ok` per declaration: implemented (funcs), and every obligation
     /// of it and of the declarations it uses, transitively, proved.
@@ -169,6 +174,7 @@ impl Report {
             })
             .collect();
         let f = ReportFile {
+            certificate: self.certificate.clone(),
             run: RunEntry { time: format!("{} UTC", fmt_time(self.time)), unix_time: self.time, duration_secs: self.duration_secs, pass: self.pass, stage: self.stage.clone(), errors: self.errors.clone() },
             decl,
         };
@@ -425,10 +431,15 @@ pub fn decl_statuses(cfg: &Config, lowered: &[Lowered], names: &HashMap<String, 
         .collect();
     // the ambient functions the constraints call: trusted, no obligations,
     // recorded so that editing one marks its callers as changed
-    let mut ambient: Vec<&djinn_syntax::project::Entry> = entries.values().filter(|e| e.kind == "ambient" && lowered.iter().any(|d| d.ambient_calls.contains(&e.name))).collect();
-    ambient.sort_by(|a, b| a.name.cmp(&b.name));
-    for e in ambient {
-        v.push(DeclStatus { name: e.name.clone(), kind: "ambient".into(), implemented: true, obligations: vec![], tokens: e.tokens.clone(), uses: e.uses.clone(), ok: true, weak: false });
+    let uses: HashMap<String, Vec<String>> = entries.iter().map(|(name, entry)| (name.clone(), entry.uses.clone())).collect();
+    let mut referenced = std::collections::BTreeSet::new();
+    for d in &v {
+        referenced.extend(djinn_syntax::project::closure(&d.name, &[&uses]));
+    }
+    for name in referenced {
+        if let Some(e) = entries.get(&name).filter(|e| !matches!(e.kind.as_str(), "func" | "rel")) {
+            v.push(DeclStatus { name: e.name.clone(), kind: e.kind.clone(), implemented: true, obligations: vec![], tokens: e.tokens.clone(), uses: e.uses.clone(), ok: true, weak: false });
+        }
     }
     v
 }
@@ -495,9 +506,9 @@ fn archive_stale(cfg: &Config, lowered: &[Lowered], cx: &EmitCx, log: &mut Log, 
     let mut removed_funcs: Vec<String> = Vec::new();
     if let Some(r) = &report {
         for d in &r.declarations {
-            // ambient functions are recorded for change detection only; they
-            // are not declarations and own nothing in the Lean files
-            if d.kind == "ambient" {
+            // Dependency entries record freshness, not declarations that own
+            // obligations or implementations in the generated Lean files.
+            if !matches!(d.kind.as_str(), "func" | "rel") {
                 continue;
             }
             if !current.contains(d.name.as_str()) {
@@ -780,7 +791,7 @@ pub fn translate_opts(cfg: &Config, log: &mut Log, archive_rust: bool) -> Result
     // an initial report, so that `cargo build` can say "never attempted"
     // precisely and the macro has a file to track
     if !Report::path(cfg).exists() {
-        let mut r = Report { time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new() };
+        let mut r = Report { certificate: None, time: now(), duration_secs: 0, pass: false, stage: "not run".into(), obligations: BTreeMap::new(), declarations: decl_statuses(cfg, &lowered, &names), errors: Vec::new(), log_tail: Vec::new() };
         for d in &r.declarations {
             for o in &d.obligations {
                 r.obligations.insert(o.clone(), "unverified".into());
@@ -858,6 +869,7 @@ fn noise(line: &str) -> bool {
 pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
     let start = now();
     let mut report = Report {
+        certificate: None,
         time: start,
         duration_secs: 0,
         pass: false,
@@ -888,6 +900,7 @@ pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
     report.duration_secs = now() - start;
     report.log_tail = log.text.lines().rev().take(80).map(|s| s.to_string()).collect::<Vec<_>>().into_iter().rev().collect();
     report.finalize();
+    if !report.pass { report.certificate = None; }
     report.save(cfg);
     if let Some(j) = jail {
         if let Err(e) = jail::sync_forward(cfg, j) {
@@ -900,11 +913,18 @@ pub fn verify(cfg: &Config, jail: Option<&Path>, log: &mut Log) -> Report {
 /// Stages 1–4 of the gate: `cargo build`, the safe-Rust check, Charon, Aeneas
 /// (regenerating `Code/`), and the audit of `translation.json`.
 pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, String)> {
+    aeneas_pipeline_bound(cfg, log).map(|_| ())
+}
+
+fn aeneas_pipeline_bound(cfg: &Config, log: &mut Log) -> Result<djinn_syntax::certificate::Certificate, (String, String)> {
     let stage = |s: &str, e: String| (s.to_string(), e);
     // 1. the crate builds: signatures of spec and solution agree
     // the verifier is the one party allowed to compile an unverified crate
     run(Command::new("cargo").args(["build", "--quiet"]).env("DJINN_VERIFYING", "1").current_dir(&cfg.crate_dir), "cargo build", log)
         .map_err(|e| stage("cargo build", e))?;
+    // Cargo may create Cargo.lock on the first build. Bind the complete input
+    // only after that, and before extraction sees any implementation.
+    let certificate = djinn_syntax::certificate::capture(&cfg.crate_dir).map_err(|e| stage("source snapshot", e))?;
     // 1b. only safe Rust: the solution must be included under
     // `#[forbid(unsafe_code)]`, and must not spell `unsafe` at all
     check_safe(cfg).map_err(|e| stage("unsafe", e))?;
@@ -976,7 +996,7 @@ pub fn aeneas_pipeline(cfg: &Config, log: &mut Log) -> Result<(), (String, Strin
             Err(uncovered) => return Err(stage("externals", explain_externals(cfg, &uncovered))),
         }
     }
-    Ok(())
+    Ok(certificate)
 }
 
 /// The `Name pattern`s of the items Aeneas could not model.
@@ -1070,8 +1090,8 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
         }
         report.declarations = decl_statuses(cfg, &lowered, &impl_names(cfg));
     }
-    // 1–4. build, Charon, Aeneas, audit
-    aeneas_pipeline(cfg, log)?;
+    // 1–4. Build and extract the exact source captured before Charon.
+    let certificate = aeneas_pipeline_bound(cfg, log)?;
     // 5. regenerate the trusted files
     translate_opts(cfg, log, jail.is_none()).map_err(|e| stage("translate", e))?;
     report.declarations = decl_statuses(cfg, &lowered, &impl_names(cfg));
@@ -1124,5 +1144,10 @@ fn verify_inner(cfg: &Config, jail: Option<&Path>, log: &mut Log, report: &mut R
     if !bad.is_empty() {
         return Err(stage("axiom audit", format!("FAIL: axiom audit\n  {}", bad.join("\n  "))));
     }
+    // Concurrent edits, build scripts and other pipeline side effects must not
+    // turn a proof of the extracted program into a certificate for another one.
+    let after = djinn_syntax::certificate::capture(&cfg.crate_dir).map_err(|e| stage("source snapshot", e))?;
+    if certificate != after { return Err(stage("source snapshot", "source inputs changed during verification; run verification again on stable inputs".into())); }
+    report.certificate = Some(certificate);
     Ok(())
 }

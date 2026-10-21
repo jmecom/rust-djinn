@@ -80,6 +80,16 @@ fn conditional_definitions_fail_closed_before_constant_selection() {
 }
 
 #[test]
+fn unconditional_type_and_constant_sources_are_recorded() {
+    let program = parse_program("const LIMIT: u8 = 2; struct S { x: u8 } enum E { A(u8) } djinn! { fn f() -> r: u8 { r == LIMIT; } }").unwrap();
+    assert_eq!(program.types.sources.len(), 3);
+    for name in ["LIMIT", "S", "E"] {
+        assert!(!program.types.sources[name].is_empty());
+    }
+    assert!(contract("s.iter().all(|x| x in t)").contains('∈'));
+}
+
+#[test]
 fn specification_maps_do_not_silently_discard_a_custom_hasher() {
     let error = parse_program("djinn! { rel p(m: HashMap<u8, u8, CustomHasher>) { m.len() == 0; } }").unwrap_err();
     assert!(error.msg.contains("standard default hasher"), "{}", error.msg);

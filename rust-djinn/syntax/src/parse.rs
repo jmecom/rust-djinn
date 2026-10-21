@@ -1285,6 +1285,7 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                     variants.push(VariantDef { name: v.ident.to_string(), fields });
                 }
                 t.enums.insert(e.ident.to_string(), EnumDef { name: e.ident.to_string(), variants });
+                t.sources.insert(e.ident.to_string(), crate::project::canonical(&item.to_token_stream()));
             }
             syn::Item::Struct(s) => {
                 reject_conditional(&s.attrs)?;
@@ -1300,6 +1301,7 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                     _ => return Err(Error::new(s.ident.span(), "only structs with named fields are supported in specifications")),
                 };
                 t.structs.insert(s.ident.to_string(), StructDef { name: s.ident.to_string(), fields });
+                t.sources.insert(s.ident.to_string(), crate::project::canonical(&item.to_token_stream()));
             }
             syn::Item::Fn(f) => {
                 reject_conditional(&f.attrs)?;
@@ -1373,6 +1375,7 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 };
                 let (ty, _) = convert_type(&c.ty)?;
                 t.consts.insert(c.ident.to_string(), Const { name: c.ident.to_string(), ty, value });
+                t.sources.insert(c.ident.to_string(), crate::project::canonical(&item.to_token_stream()));
             }
             syn::Item::Macro(m) if m.mac.path.segments.last().is_some_and(|s| matches!(s.ident.to_string().as_str(), "djinn" | "func" | "rel")) => {
                 reject_conditional(&m.attrs)?;

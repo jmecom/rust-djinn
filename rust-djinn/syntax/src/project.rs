@@ -39,7 +39,14 @@ pub fn canonical_trees(trees: &[TokenTree]) -> String {
             }
             TokenTree::Ident(i) => out.push(i.to_string()),
             TokenTree::Punct(p) => out.push(p.as_char().to_string()),
-            TokenTree::Literal(l) => out.push(l.to_string()),
+            TokenTree::Literal(l) => {
+                // rustc and standalone proc_macro2 can escape the same doc
+                // string differently (notably apostrophes). Compare values.
+                let text = l.to_string();
+                out.push(syn::parse_str::<syn::LitStr>(&text)
+                    .map(|s| format!("{:?}{}", s.value(), s.suffix()))
+                    .unwrap_or(text));
+            }
         }
     }
     out.join(" ")
@@ -49,8 +56,7 @@ pub fn canonical_trees(trees: &[TokenTree]) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
-    /// `func`, `rel`, or `ambient` (an ordinary function of the file that
-    /// constraints call).
+    /// `func`, `rel`, `ambient`, `type`, or `constant`.
     pub kind: String,
     pub tokens: String,
     /// Other declarations mentioned in the tokens, in order of first mention.
@@ -62,8 +68,8 @@ pub fn index(decls: &[Decl]) -> Vec<Entry> {
     index_with(decls, &[])
 }
 
-fn index_with(decls: &[Decl], ambient: &[(String, String)]) -> Vec<Entry> {
-    let names: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).chain(ambient.iter().map(|(n, _)| n.as_str())).collect();
+fn index_with(decls: &[Decl], context: &[(String, String, String)]) -> Vec<Entry> {
+    let names: HashSet<&str> = decls.iter().map(|d| d.name.as_str()).chain(context.iter().map(|(n, _, _)| n.as_str())).collect();
     let uses_of = |me: &str, source: &str| {
         let mut uses = Vec::new();
         for w in source.split(' ') {
@@ -76,15 +82,19 @@ fn index_with(decls: &[Decl], ambient: &[(String, String)]) -> Vec<Entry> {
     decls
         .iter()
         .map(|d| Entry { name: d.name.clone(), kind: d.kind.word().into(), tokens: d.source.clone(), uses: uses_of(&d.name, &d.source) })
-        .chain(ambient.iter().map(|(n, src)| Entry { name: n.clone(), kind: "ambient".into(), tokens: src.clone(), uses: uses_of(n, src) }))
+        .chain(context.iter().map(|(n, kind, src)| Entry { name: n.clone(), kind: kind.clone(), tokens: src.clone(), uses: uses_of(n, src) }))
         .collect()
 }
 
 /// Entries for a parsed program: its declarations and its ambient functions.
 pub fn index_program(prog: &Program) -> Vec<Entry> {
-    let mut ambient: Vec<(String, String)> = prog.types.ambient.values().map(|a| (a.name.clone(), a.source.clone())).collect();
-    ambient.sort();
-    index_with(&prog.decls, &ambient)
+    let mut context: Vec<(String, String, String)> = prog.types.ambient.values().map(|a| (a.name.clone(), "ambient".into(), a.source.clone())).collect();
+    context.extend(prog.types.sources.iter().map(|(name, source)| {
+        let kind = if prog.types.consts.contains_key(name) { "constant" } else { "type" };
+        (name.clone(), kind.into(), source.clone())
+    }));
+    context.sort();
+    index_with(&prog.decls, &context)
 }
 
 /// Entries for a specification source text (empty if it does not parse).
@@ -264,15 +274,25 @@ pub fn module_of(crate_dir: &Path, path: &Path) -> Option<String> {
 /// `func!`/`rel!` forms)? A text that does not parse counts if it mentions
 /// `djinn!`, so that its error is reported rather than the file ignored.
 pub fn has_djinn(src: &str) -> bool {
-    if !(src.contains("djinn!") || src.contains("func!") || src.contains("rel!")) {
-        return false;
-    }
     match syn::parse_file(src) {
         Ok(f) => f.items.iter().any(|it| match it {
             syn::Item::Macro(m) => m.mac.path.segments.last().is_some_and(|s| matches!(s.ident.to_string().as_str(), "djinn" | "func" | "rel")),
             _ => false,
         }),
-        Err(_) => src.contains("djinn!"),
+        Err(_) => {
+            // Tokenization handles whitespace/comments between the name and
+            // `!`, including malformed bodies whose error must be reported.
+            fn mentions(ts: TokenStream) -> bool {
+                let trees: Vec<_> = ts.into_iter().collect();
+                trees.iter().enumerate().any(|(i, t)| match t {
+                    TokenTree::Ident(n) => matches!(n.to_string().as_str(), "djinn" | "func" | "rel")
+                        && matches!(trees.get(i + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
+                    TokenTree::Group(g) => mentions(g.stream()),
+                    _ => false,
+                })
+            }
+            src.parse::<TokenStream>().map(mentions).unwrap_or_else(|_| src.contains("djinn"))
+        },
     }
 }
 
@@ -307,5 +327,33 @@ mod tests {
         assert!(crate::lower_program(&p).is_ok());
         let e = crate::parse_sources(&[a.clone(), a]).unwrap_err();
         assert_eq!(e.file, 1);
+    }
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    fn map(source: &str) -> HashMap<String, Entry> {
+        index_text(source).into_iter().map(|e| (e.name.clone(), e)).collect()
+    }
+    #[test]
+    fn string_fingerprints_use_values_and_preserve_suffixes() {
+        let fingerprint = |s: &str| canonical(&s.parse().unwrap());
+        assert_eq!(fingerprint(r#""format's""#), fingerprint(r#""format\'s""#));
+        assert_eq!(fingerprint(r#""a\n""#), fingerprint(r#""\u{61}\x0a""#));
+        assert_ne!(fingerprint(r#""a""#), fingerprint(r#""b""#));
+        assert_ne!(fingerprint(r#""a""#), fingerprint(r#""a"suffix"#));
+    }
+    #[test]
+    fn constants_and_type_shapes_participate_in_freshness() {
+        let original = map("const LIMIT: u8 = 1; enum E { A } djinn! { fn f(x: E) -> r: u8 { r == LIMIT; } }");
+        assert_eq!(stale("f", &original, &map("const LIMIT: u8 = 2; enum E { A } djinn! { fn f(x: E) -> r: u8 { r == LIMIT; } }")), Some("LIMIT".into()));
+        assert_eq!(stale("f", &original, &map("const LIMIT: u8 = 1; enum E { A, B } djinn! { fn f(x: E) -> r: u8 { r == LIMIT; } }")), Some("E".into()));
+    }
+    #[test]
+    fn source_discovery_accepts_spacing_and_comments() {
+        for source in ["djinn ! { fn f() {} }", "djinn\n! { fn f() {} }", "djinn /* comment */ ! { fn f() {} }"] {
+            assert!(has_djinn(source));
+        }
     }
 }

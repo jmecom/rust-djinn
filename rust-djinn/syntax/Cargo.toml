@@ -6,4 +6,7 @@ edition = "2021"
 [dependencies]
 proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
-syn = { version = "2", features = ["full", "extra-traits", "printing"] }
+syn = { version = "2", features = ["full", "extra-traits", "printing", "visit"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+toml = "0.8"

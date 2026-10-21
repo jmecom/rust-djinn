@@ -348,7 +348,7 @@ pub fn job_elapsed(job: &Job) -> u64 {
 pub enum ObState {
     /// proved and audited by the last `verify`
     Verified,
-    /// elaborates without errors or `sorry` in a local type-check (not yet verified)
+    /// Reserved for a confined local elaboration; presence inspection never emits it.
     Local,
     /// a theorem exists but has errors or a `sorry`
     Drafted,
@@ -369,70 +369,20 @@ impl ObState {
     }
 }
 
-/// Type-check a `Proofs.lean` and classify every theorem in it.
-/// Returns `None` if Lean could not be run.
-pub fn local_states(ns: &str, proofs: &Path, timeout_secs: u64) -> Option<std::collections::HashMap<String, ObState>> {
+/// Inspect proof presence without executing project-controlled Lean or Lake
+/// code. Only explicit, confined `verify` runs may establish checked states.
+/// A theorem body, including one without `sorry`, is only a draft here.
+pub fn local_states(ns: &str, proofs: &Path, _timeout_secs: u64) -> Option<std::collections::HashMap<String, ObState>> {
     let file = proofs.join(ns).join("Proofs.lean");
-    let text = fs::read_to_string(&file).ok()?;
-    // theorem name → (first line, last line), 1-based
-    let mut spans: Vec<(String, usize, usize)> = Vec::new();
-    let starts_decl = |l: &str| {
-        let t = l.trim_start();
-        !l.starts_with(' ') && (t.starts_with("theorem ") || t.starts_with("def ") || t.starts_with("lemma ") || t.starts_with("@[") || t.starts_with("end ") || t.starts_with("namespace ") || t.starts_with("instance ") || t.starts_with("abbrev "))
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    for (i, l) in lines.iter().enumerate() {
-        if let Some(rest) = l.strip_prefix("theorem ") {
+    let text = fs::read_to_string(file).ok()?;
+    let mut states = std::collections::HashMap::new();
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("theorem ") {
             let name: String = rest.trim_start().chars().take_while(|c| !c.is_whitespace() && *c != ':').collect();
-            let mut end = lines.len();
-            for (j, m) in lines.iter().enumerate().skip(i + 1) {
-                if starts_decl(m) {
-                    end = j;
-                    break;
-                }
-            }
-            spans.push((name, i + 1, end));
+            if !name.is_empty() { states.insert(name, ObState::Drafted); }
         }
     }
-    let mut child = Command::new("lake")
-        .args(["env", "lean"])
-        .arg(format!("{ns}/Proofs.lean"))
-        .current_dir(proofs)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-    let start = std::time::Instant::now();
-    let out = loop {
-        if let Ok(Some(_)) = child.try_wait() {
-            break child.wait_with_output().ok()?;
-        }
-        if start.elapsed().as_secs() > timeout_secs {
-            let _ = child.kill();
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    };
-    let output = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    let mut bad_lines: Vec<usize> = Vec::new();
-    for l in output.lines() {
-        // <path>:<line>:<col>: error: … | warning: declaration uses 'sorry'
-        if l.contains(": error") || l.contains("declaration uses 'sorry'") || l.contains("declaration uses `sorry`") {
-            let mut parts = l.splitn(4, ':');
-            let _file = parts.next();
-            if let Some(n) = parts.next().and_then(|x| x.trim().parse::<usize>().ok()) {
-                bad_lines.push(n);
-            }
-        }
-    }
-    let mut m = std::collections::HashMap::new();
-    for (name, a, b) in spans {
-        let body = lines[a - 1..b].join("\n");
-        let has_sorry = body.contains("sorry");
-        let has_err = bad_lines.iter().any(|&n| n >= a && n <= b);
-        m.insert(name, if has_sorry || has_err { ObState::Drafted } else { ObState::Local });
-    }
-    Some(m)
+    Some(states)
 }
 
 #[derive(Clone, Debug)]
@@ -461,7 +411,7 @@ impl DeclView {
             return "CHANGED since verification — re-run verify".into();
         }
         let ok = |s: ObState| matches!(s, ObState::Verified | ObState::Local);
-        if self.kind == "ambient" {
+        if matches!(self.kind.as_str(), "ambient" | "constant" | "type") {
             return "trusted Rust of the specification file (not verified)".into();
         }
         if self.kind == "rel" {
@@ -499,7 +449,7 @@ impl DeclView {
             .filter(|(n, _)| n != "unambiguous" && n != "impl_correct")
             .map(|(n, s)| format!("{n} {}", sym(*s)))
             .collect();
-        if self.kind == "rel" || self.kind == "ambient" {
+        if matches!(self.kind.as_str(), "rel" | "ambient" | "constant" | "type") {
             return format!("  {:4} {:16} [{}]   → {}\n", self.kind, self.name, others.join(", "), self.phase());
         }
         format!(
@@ -517,7 +467,7 @@ impl DeclView {
 }
 
 /// Declaration views from the last verify report, optionally overlaid with
-/// a local assessment (a solution directory and a type-checked Proofs.lean).
+/// a local assessment (a solution directory and proof presence).
 pub fn views(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &Path)>) -> Vec<DeclView> {
     let texts: Vec<String> = cfg.spec_texts().unwrap_or_default().into_iter().map(|(_, t)| t).collect();
     views_text(cfg, report, local, &texts)
@@ -545,6 +495,14 @@ pub fn views_text(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &
             Err(_) => report.map(|r| r.declarations.clone()).unwrap_or_default(),
         },
     };
+    let certificate_fresh = report.and_then(|r| r.certificate.as_ref()).is_some_and(|recorded| {
+        recorded.version == djinn_syntax::certificate::VERSION
+            && djinn_syntax::certificate::capture(&cfg.crate_dir).is_ok_and(|current| &current == recorded)
+    });
+    let same_local = local.is_none_or(|(sol, proofs)| {
+        sol.canonicalize().ok() == cfg.solution_dir().canonicalize().ok()
+            && proofs.canonicalize().ok() == cfg.proofs.canonicalize().ok()
+    });
     let local_fns = local.map(|(sol, _)| crate::verify::solution_fns_in(sol));
     let local_obs = local.and_then(|(_, proofs)| local_states(&cfg.ns, proofs, 180));
     decls
@@ -559,7 +517,8 @@ pub fn views_text(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &
                 .iter()
                 .map(|o| {
                     let short = o.rsplit('.').next().unwrap_or(o).to_string();
-                    let verified = report.and_then(|r| r.obligations.get(o)).map(|v| v == "proved").unwrap_or(false);
+                    let verified = certificate_fresh && same_local
+                        && report.and_then(|r| r.obligations.get(o)).map(|v| v == "proved").unwrap_or(false);
                     let st = match &local_obs {
                         Some(m) => match m.get(o) {
                             Some(ObState::Local) if verified => ObState::Verified,
@@ -567,7 +526,9 @@ pub fn views_text(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &
                             None => ObState::Missing,
                         },
                         None => {
-                            if verified {
+                            if local.is_some() {
+                                ObState::Unknown
+                            } else if verified {
                                 ObState::Verified
                             } else {
                                 match report.and_then(|r| r.obligations.get(o)).map(|s| s.as_str()) {
@@ -590,9 +551,9 @@ pub fn views_text(cfg: &Config, report: Option<&Report>, local: Option<(&Path, &
             };
             // changed since the report: its tokens, or a used declaration's,
             // differ (the same test the `djinn!` macro applies)
-            let changed = report.is_some()
-                && current.contains_key(&d.name)
-                && (!recorded.contains_key(&d.name) || djinn_syntax::project::stale(&d.name, &recorded, &current).is_some());
+            let changed = report.is_some() && (!certificate_fresh || !same_local
+                || !current.contains_key(&d.name)
+                || djinn_syntax::project::stale(&d.name, &recorded, &current).is_some());
             DeclView { name: d.name, kind: d.kind, implemented, obs, changed, weak: d.weak }
         })
         .collect()
