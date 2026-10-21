@@ -161,7 +161,9 @@ fn run(id: u64) -> Option<u64> {{
 
 fn measure(id: u64, per_batch: f64, batches: usize) -> (u64, Vec<f64>, Option<u64>) {{
     let size = run(id);
-    // calibrate: double until one batch takes at least per_batch seconds
+    // Bound every upcoming batch, including the first calibration estimate.
+    // Limiting growth also avoids amplifying a short, noisy timer sample.
+    const MAX_ITERS: u64 = 1 << 40;
     let mut iters: u64 = 1;
     loop {{
         let t = Instant::now();
@@ -169,11 +171,11 @@ fn measure(id: u64, per_batch: f64, batches: usize) -> (u64, Vec<f64>, Option<u6
             run(id);
         }}
         let el = t.elapsed().as_secs_f64();
-        if el >= per_batch || iters >= 1u64 << 40 {{
+        if el >= per_batch || iters == MAX_ITERS {{
             break;
         }}
         let factor = if el > 0.0 {{ (per_batch / el * 1.2).ceil() as u64 }} else {{ 10 }};
-        iters = iters.saturating_mul(factor.max(2));
+        iters = iters.saturating_mul(factor.clamp(2, 10)).min(MAX_ITERS);
     }}
     let mut ns = Vec::new();
     for _ in 0..batches {{
@@ -191,6 +193,10 @@ fn main() {{
     let min_secs: f64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let batches: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
     let jobs: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1).max(1);
+    if !min_secs.is_finite() || min_secs <= 0.0 || batches == 0 {{
+        eprintln!("min-time must be finite and positive; batches must be positive");
+        std::process::exit(2);
+    }}
     let per_batch = min_secs / batches as f64;
     let points: Vec<u64> = vec![{points}];
     let start = Instant::now();
@@ -227,17 +233,58 @@ fn main() {{
     Ok(dir)
 }
 
+/// Check options before verification, compilation, or any workload execution.
+pub fn validate_options(min_time: f64, batches: usize) -> Result<(), String> {
+    if !min_time.is_finite() || min_time <= 0.0 {
+        return Err("--min-time must be a finite, positive number of seconds".into());
+    }
+    if batches == 0 {
+        return Err("--batches must be greater than zero".into());
+    }
+    Ok(())
+}
+
+/// Cargo knows the target directory and target triple; its artifact path is
+/// authoritative even when a previous runner exists in the default directory.
+fn runner_executable(output: &[u8]) -> Result<PathBuf, String> {
+    let mut executable = None;
+    for line in output.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let message: serde_json::Value = serde_json::from_slice(line).map_err(|e| format!("cargo build output: {e}"))?;
+        if message["reason"] == "compiler-artifact"
+            && message["target"]["name"] == "djinn-bench-runner"
+            && message["target"]["kind"].as_array().is_some_and(|kinds| kinds.iter().any(|k| k == "bin"))
+        {
+            if let Some(path) = message["executable"].as_str() {
+                let path = PathBuf::from(path);
+                if executable.as_ref().is_some_and(|old| old != &path) {
+                    return Err("cargo reported several benchmark runner executables".into());
+                }
+                executable = Some(path);
+            }
+        }
+    }
+    executable.ok_or_else(|| "cargo did not report the benchmark runner executable".into())
+}
+
 /// Build the runner in release mode and run it: `jobs` points at a time.
 pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &mut dyn FnMut(&str)) -> Result<Measurement, String> {
+    validate_options(min_time, batches)?;
     let dir = write_runner(cfg)?;
     log("== bench: building the workload runner (release)");
     let out = Command::new("cargo")
-        .args(["build", "--release", "--quiet"])
+        .args(["build", "--release", "--quiet", "--message-format=json-render-diagnostics"])
         .current_dir(&dir)
         .output()
         .map_err(|e| format!("cargo: {e}"))?;
     if !out.status.success() {
-        let text = String::from_utf8_lossy(&out.stderr);
+        let mut text = String::from_utf8_lossy(&out.stderr).into_owned();
+        for line in out.stdout.split(|b| *b == b'\n') {
+            if let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) {
+                if let Some(rendered) = message["message"]["rendered"].as_str() {
+                    text.push_str(rendered);
+                }
+            }
+        }
         let tail: Vec<&str> = text.lines().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect();
         return Err(format!("bench runner failed to build:\n{}", tail.join("\n")));
     }
@@ -246,7 +293,7 @@ pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &m
         "== bench: running the workload for at least {min_time:.0} s ({batches} batches){}",
         if npoints > 1 { format!(" at each of {npoints} points, {} at a time", jobs.min(npoints)) } else { String::new() }
     ));
-    let exe = dir.join("target").join("release").join("djinn-bench-runner");
+    let exe = runner_executable(&out.stdout)?;
     let out = Command::new(&exe)
         .arg(format!("{min_time}"))
         .arg(format!("{batches}"))
@@ -296,4 +343,32 @@ pub fn measure(cfg: &Config, min_time: f64, batches: usize, jobs: usize, log: &m
         }
     }
     Ok(m)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn measurement_options_reject_invalid_work_sizes() {
+        for min_time in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(validate_options(min_time, 5).is_err());
+        }
+        assert!(validate_options(0.01, 0).is_err());
+        assert!(validate_options(0.01, 5).is_ok());
+    }
+
+    #[test]
+    fn cargo_artifacts_select_runner_and_preserve_target_path() {
+        let messages = r#"{"reason":"compiler-artifact","target":{"name":"dependency","kind":["lib"]},"executable":null}
+{"reason":"compiler-artifact","target":{"name":"djinn-bench-runner","kind":["bin"]},"executable":"/custom/target/aarch64-apple-darwin/release/djinn-bench-runner"}
+{"reason":"build-finished","success":true}
+"#;
+        assert_eq!(
+            runner_executable(messages.as_bytes()).unwrap(),
+            PathBuf::from("/custom/target/aarch64-apple-darwin/release/djinn-bench-runner")
+        );
+        assert!(runner_executable(b"{\"reason\":\"build-finished\",\"success\":true}\n").is_err());
+        assert!(runner_executable(b"not a Cargo artifact\n").is_err());
+    }
 }

@@ -270,31 +270,87 @@ fn checkpoint_dir(cfg: &Config) -> PathBuf {
 }
 
 fn copy_tree(src: &Path, dst: &Path) -> Result<(), String> {
-    if src.is_dir() {
+    let meta = fs::symlink_metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("checkpoint paths must not be symlinks: {}", src.display()));
+    }
+    if meta.is_dir() {
         fs::create_dir_all(dst).map_err(|e| e.to_string())?;
-        for e in fs::read_dir(src).map_err(|e| e.to_string())?.flatten() {
-            copy_tree(&e.path(), &dst.join(e.file_name()))?;
+        for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            copy_tree(&entry.path(), &dst.join(entry.file_name()))?;
         }
-    } else {
+    } else if meta.is_file() {
         if let Some(p) = dst.parent() {
             fs::create_dir_all(p).map_err(|e| e.to_string())?;
         }
         fs::copy(src, dst).map_err(|e| format!("{}: {e}", src.display()))?;
+    } else {
+        return Err(format!("checkpoint paths must be ordinary files or directories: {}", src.display()));
     }
     Ok(())
 }
 
-/// Save the (verified) solution and proofs as the last known-good state.
-fn checkpoint(cfg: &Config) -> Result<(), String> {
+/// Save the verified solution and proofs without destroying the old checkpoint
+/// on a failed copy. Cancellation is checked again after the copy, immediately
+/// before replacing the checkpoint; `false` means no promotion took place.
+fn checkpoint(cfg: &Config, stop: &AtomicBool) -> Result<bool, String> {
     let d = checkpoint_dir(cfg);
-    let _ = fs::remove_dir_all(&d);
-    copy_tree(&cfg.solution_dir(), &d.join("solution"))?;
-    let proofs = cfg.lean_dir();
-    copy_tree(&proofs.join("Proofs.lean"), &d.join("Proofs.lean"))?;
-    if proofs.join("Proofs").is_dir() {
-        copy_tree(&proofs.join("Proofs"), &d.join("Proofs"))?;
+    let parent = d.parent().unwrap();
+    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let mut nonce = 0u64;
+    let staging = loop {
+        let p = parent.join(format!("checkpoint-{}-{nonce}", std::process::id()));
+        match fs::create_dir(&p) {
+            Ok(()) => break p,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => nonce += 1,
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let new = staging.join("new");
+    let previous = staging.join("previous");
+    let result = (|| {
+        copy_tree(&cfg.solution_dir(), &new.join("solution"))?;
+        let proofs = cfg.lean_dir();
+        copy_tree(&proofs.join("Proofs.lean"), &new.join("Proofs.lean"))?;
+        if proofs.join("Proofs").exists() {
+            copy_tree(&proofs.join("Proofs"), &new.join("Proofs"))?;
+        }
+        if stop.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let had_previous = d.exists();
+        if had_previous {
+            fs::rename(&d, &previous).map_err(|e| format!("cannot retain the old checkpoint: {e}"))?;
+        }
+        if let Err(e) = fs::rename(&new, &d) {
+            if had_previous {
+                fs::rename(&previous, &d).map_err(|restore| {
+                    format!(
+                        "cannot install checkpoint: {e}; cannot restore it: {restore}; old checkpoint remains at {}",
+                        previous.display()
+                    )
+                })?;
+            }
+            return Err(format!("cannot install checkpoint: {e}"));
+        }
+        Ok(true)
+    })();
+    // Keep the old state for manual recovery if even the restoring rename failed.
+    if result.is_ok() || !previous.exists() {
+        let _ = fs::remove_dir_all(staging);
     }
-    Ok(())
+    result
+}
+
+fn remove_tree(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let result = if metadata.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
+    result.map_err(|e| format!("cannot restore {}: {e}", path.display()))
 }
 
 /// Restore the last known-good state and re-run the verifier so the report
@@ -305,11 +361,12 @@ fn revert(cfg: &Config, why: &str) -> Result<(), String> {
     if !d.join("solution").exists() {
         return Err("no checkpoint to revert to".into());
     }
-    let _ = fs::remove_dir_all(cfg.solution_dir());
+    remove_tree(&cfg.solution_dir())?;
     copy_tree(&d.join("solution"), &cfg.solution_dir())?;
     let proofs = cfg.lean_dir();
+    remove_tree(&proofs.join("Proofs.lean"))?;
     copy_tree(&d.join("Proofs.lean"), &proofs.join("Proofs.lean"))?;
-    let _ = fs::remove_dir_all(proofs.join("Proofs"));
+    remove_tree(&proofs.join("Proofs"))?;
     if d.join("Proofs").is_dir() {
         copy_tree(&d.join("Proofs"), &proofs.join("Proofs"))?;
     }
@@ -405,8 +462,7 @@ fn size_threshold(opts: &OptOpts) -> f64 {
 // -------------------------------------------------------------------- loop
 
 pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String> {
-    crate::agent::ensure_no_running_job(cfg)?;
-    bench::workload_path(cfg)?;
+    bench::validate_options(opts.min_time, opts.batches)?;
     // Ctrl-C: stop the agent, restore the checkpoint
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -417,6 +473,14 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
         })
         .map_err(|e| format!("cannot install the Ctrl-C handler: {e}"))?;
     }
+    optimize_with_stop(cfg, opts, bin, &stop)
+}
+
+/// The loop takes its cancellation flag explicitly so each blocking boundary can
+/// be tested without launching providers or racing a process-wide signal handler.
+pub(crate) fn optimize_with_stop(cfg: &Config, opts: OptOpts, bin: &Path, stop: &AtomicBool) -> Result<bool, String> {
+    crate::agent::ensure_no_running_job(cfg)?;
+    bench::workload_path(cfg)?;
     let mut say = |s: &str| eprintln!("{s}");
 
     // 1. the gate
@@ -425,7 +489,9 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
     if !r.pass {
         return Err(format!("nothing to optimize: verify FAILs at {} — run `cargo djinn implement` first", r.stage));
     }
-    checkpoint(cfg)?;
+    if !checkpoint(cfg, stop)? {
+        return Ok(false);
+    }
     // 2. baseline
     let baseline = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
     let mut log = OptimizeLog {
@@ -478,73 +544,120 @@ pub fn optimize(cfg: &Config, opts: OptOpts, bin: &Path) -> Result<bool, String>
             agent_opts.max_budget_usd = agent_opts.limit_usd.map(|l| format!("{l:.2}"));
         }
         let text = prompt(cfg, &opts, &current, &log, opts.agent.extra_prompt.as_deref());
-        let run = agent::run_foreground(cfg, &agent_opts, &text, bin, &stop, &format!("opt{cycle}"))?;
-        let cost = run.usage.cost_usd.or(run.usage.est_cost_usd);
-        log.spent_usd += cost.unwrap_or(0.0);
         let mut attempt = Attempt {
             cycle,
-            job: run.job.id.clone(),
+            job: String::new(),
             verdict: String::new(),
             ns: None,
             points: Vec::new(),
-            summary: run.usage.last_message.chars().take(1200).collect(),
-            cost_usd: cost,
-            cost_is_estimate: run.usage.cost_usd.is_none(),
-            tokens_in: run.usage.input_tokens,
-            tokens_out: run.usage.output_tokens,
-            elapsed_secs: status::job_elapsed(&run.job),
+            summary: String::new(),
+            cost_usd: None,
+            cost_is_estimate: true,
+            tokens_in: 0,
+            tokens_out: 0,
+            elapsed_secs: 0,
         };
-        if run.interrupted {
-            attempt.verdict = "interrupted".into();
-            log.attempts.push(attempt);
-            log.interrupted = true;
-            revert(cfg, "interrupted")?;
-            break;
-        }
-        // (1) it must verify, with the agent's files synced from its jail
-        let r = verify::verify(cfg, Some(&run.job.jail), &mut Log::new(false));
-        if !r.pass {
-            attempt.verdict = format!("did not verify (stage: {})", r.stage);
-            eprintln!("cycle {cycle}: {}", attempt.verdict);
-            log.attempts.push(attempt);
-            log.save(cfg);
-            revert(cfg, "verification failed")?;
-            continue;
-        }
-        // (2) it must be better beyond noise and threshold: faster, or for a
-        // multi-point workload a better trade-off curve
-        let m = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
-        attempt.ns = Some(m.median_ns);
-        attempt.points = point_list(&m);
-        let required = opts.threshold.max(current.noise()).max(m.noise());
-        let verdict = if m.is_multi() {
-            frontier_verdict(&current, &m, required, size_threshold(&opts))
-        } else {
-            let improvement = 1.0 - m.median_ns / current.median_ns;
-            if improvement >= required {
-                Ok(improvement)
-            } else {
-                Err(format!("not faster ({:+.1}%, needed {:.1}%)", improvement * 100.0, required * 100.0))
+        // An agent may sync files through MCP before run_foreground returns, so
+        // every exit from this transaction must either promote or restore them.
+        let candidate = (|| -> Result<Option<Measurement>, String> {
+            attempt.verdict = "agent failed".into();
+            let run = agent::run_foreground(cfg, &agent_opts, &text, bin, stop, &format!("opt{cycle}"))?;
+            let cost = run.usage.cost_usd.or(run.usage.est_cost_usd);
+            log.spent_usd += cost.unwrap_or(0.0);
+            attempt.job = run.job.id.clone();
+            attempt.summary = run.usage.last_message.chars().take(1200).collect();
+            attempt.cost_usd = cost;
+            attempt.cost_is_estimate = run.usage.cost_usd.is_none();
+            attempt.tokens_in = run.usage.input_tokens;
+            attempt.tokens_out = run.usage.output_tokens;
+            attempt.elapsed_secs = status::job_elapsed(&run.job);
+            if run.interrupted || stop.load(Ordering::SeqCst) {
+                attempt.verdict = "interrupted".into();
+                return Ok(None);
             }
-        };
-        match verdict {
-            Ok(improvement) => {
-                attempt.verdict = format!("accepted ({:.1}% better)", improvement * 100.0);
-                eprintln!("cycle {cycle}: ACCEPTED — {} → {} ({:.1}% better)", fmt_ns(current.median_ns), fmt_ns(m.median_ns), improvement * 100.0);
+            if !run.exit_ok {
+                return Ok(None);
+            }
+            // (1) Verify with the agent's files synced from its jail.
+            let r = verify::verify(cfg, Some(&run.job.jail), &mut Log::new(false));
+            if stop.load(Ordering::SeqCst) {
+                attempt.verdict = "interrupted".into();
+                return Ok(None);
+            }
+            if !r.pass {
+                attempt.verdict = format!("did not verify (stage: {})", r.stage);
+                return Ok(None);
+            }
+            // (2) Re-measure. An error is a rejected attempt, even if it verified.
+            attempt.verdict = "benchmark failed".into();
+            let m = bench::measure(cfg, opts.min_time, opts.batches, opts.jobs, &mut say)?;
+            attempt.ns = Some(m.median_ns);
+            attempt.points = point_list(&m);
+            if stop.load(Ordering::SeqCst) {
+                attempt.verdict = "interrupted".into();
+                return Ok(None);
+            }
+            let required = opts.threshold.max(current.noise()).max(m.noise());
+            let verdict = if m.is_multi() {
+                frontier_verdict(&current, &m, required, size_threshold(&opts))
+            } else {
+                let improvement = 1.0 - m.median_ns / current.median_ns;
+                if improvement >= required {
+                    Ok(improvement)
+                } else {
+                    Err(format!("not faster ({:+.1}%, needed {:.1}%)", improvement * 100.0, required * 100.0))
+                }
+            };
+            match verdict {
+                Ok(improvement) => {
+                    attempt.verdict = "checkpoint failed".into();
+                    if !checkpoint(cfg, stop)? {
+                        attempt.verdict = "interrupted".into();
+                        return Ok(None);
+                    }
+                    attempt.verdict = format!("accepted ({:.1}% better)", improvement * 100.0);
+                    eprintln!("cycle {cycle}: ACCEPTED — {} → {} ({:.1}% better)", fmt_ns(current.median_ns), fmt_ns(m.median_ns), improvement * 100.0);
+                    Ok(Some(m))
+                }
+                Err(why) => {
+                    attempt.verdict = why;
+                    Ok(None)
+                }
+            }
+        })();
+        match candidate {
+            Ok(Some(m)) => {
                 current = m;
                 log.current_ns = current.median_ns;
                 log.current_points = point_list(&current);
                 log.accepted += 1;
                 log.attempts.push(attempt);
                 log.save(cfg);
-                checkpoint(cfg)?;
             }
-            Err(why) => {
-                attempt.verdict = why;
+            rejected => {
+                if let Err(error) = &rejected {
+                    attempt.verdict = format!("{}: {}", attempt.verdict, error.chars().take(500).collect::<String>());
+                }
+                if stop.load(Ordering::SeqCst) || attempt.verdict == "interrupted" {
+                    log.interrupted = true;
+                    attempt.verdict = "interrupted".into();
+                }
                 eprintln!("cycle {cycle}: {} — reverting", attempt.verdict);
+                let rollback = revert(cfg, &attempt.verdict);
                 log.attempts.push(attempt);
+                if rejected.is_err() || rollback.is_err() || log.interrupted {
+                    log.finished = Some(now());
+                }
                 log.save(cfg);
-                revert(cfg, "not better")?;
+                match (rejected, rollback) {
+                    (Err(error), Err(rollback)) => return Err(format!("{error}; rollback also failed: {rollback}")),
+                    (Err(error), Ok(())) => return Err(error),
+                    (_, Err(rollback)) => return Err(rollback),
+                    _ => {}
+                }
+                if log.interrupted {
+                    break;
+                }
             }
         }
     }

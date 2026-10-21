@@ -38,6 +38,15 @@ fn usage() -> ExitCode {
     ExitCode::from(2)
 }
 
+fn number<T: std::str::FromStr>(i: &mut usize, args: &[String]) -> Result<T, ExitCode> {
+    let flag = &args[*i];
+    *i += 1;
+    args.get(*i).ok_or_else(usage)?.parse().map_err(|_| {
+        eprintln!("{flag} expects a number");
+        ExitCode::from(2)
+    })
+}
+
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(|s| s == "djinn").unwrap_or(false) {
@@ -119,8 +128,8 @@ fn main() -> ExitCode {
             "--timeout" => sb.timeout_ms = match next(&mut i, &args) { Ok(v) => v.parse::<u64>().unwrap_or(10) * 1000, Err(c) => return c },
             "--only" => sb.only = Some(match next(&mut i, &args) { Ok(v) => v, Err(c) => return c }),
             "--cycles" => cycles = match next(&mut i, &args) { Ok(v) => v.parse().ok(), Err(c) => return c },
-            "--min-time" => min_time = match next(&mut i, &args) { Ok(v) => v.parse().unwrap_or(5.0), Err(c) => return c },
-            "--batches" => batches = match next(&mut i, &args) { Ok(v) => v.parse().unwrap_or(5), Err(c) => return c },
+            "--min-time" => min_time = match number(&mut i, &args) { Ok(v) => v, Err(c) => return c },
+            "--batches" => batches = match number(&mut i, &args) { Ok(v) => v, Err(c) => return c },
             "--jobs" => jobs = match next(&mut i, &args) { Ok(v) => v.parse().unwrap_or(4), Err(c) => return c },
             "--threshold" => threshold = match next(&mut i, &args) { Ok(v) => v.trim_end_matches('%').parse::<f64>().map(|x| x / 100.0).unwrap_or(0.03), Err(c) => return c },
             "--bench" => bench_override = Some(match next(&mut i, &args) { Ok(v) => v, Err(c) => return c }),
@@ -138,6 +147,12 @@ fn main() -> ExitCode {
             _ => return usage(),
         }
         i += 1;
+    }
+    if matches!(cmd.as_deref(), Some("bench" | "optimize")) {
+        if let Err(e) = bench::validate_options(min_time, batches) {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
     }
     let mut cfg = match load_config(&manifest) {
         Ok(c) => c,
