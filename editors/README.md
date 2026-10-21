@@ -5,7 +5,8 @@ It runs **beside rust-analyzer**: the editor attaches both servers to Rust
 documents, rust-analyzer handles the Rust, and `rust-djinn-lsp` only acts on
 a crate's specification files: by default every file under `src/` with a
 `djinn! { … }` block, or the files `[package.metadata.djinn] spec` names.
-Other Rust files get nothing from it.
+Other Rust files get nothing from it. Smoke checks include unsaved specification
+buffers and report failed or unsupported checks explicitly.
 
 | Feature | LSP mechanism | What you see |
 |---|---|---|
@@ -53,7 +54,7 @@ Commands in the palette: *Djinn: Implement*, *Verify*, *Smoke-test*, *Open
 the proof obligations*, *Open the proofs* (both of the function under the
 cursor), *Open the guide*, *Status*. They are chords on `ctrl+alt+d`
 followed by `i`, `v`, `s`, `o`, `p`, `g` and `shift+s`, the same letters as
-the Neovim keys. The code lenses call the same commands.
+the Neovim keys. The code lenses call the same commands and use the configured `djinn.agent`.
 
 ## Neovim (0.10+; tested with 0.12)
 
@@ -70,6 +71,7 @@ vim.api.nvim_create_autocmd("FileType", {
       name = "rust-djinn-lsp",
       cmd = { "/path/to/rust-djinn/target/debug/rust-djinn-lsp" },
       root_dir = vim.fs.root(ev.buf, { "Cargo.toml" }),
+      init_options = { agent = "codex" }, -- also used by the Implement code lens
     })
   end,
 })

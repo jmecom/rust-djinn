@@ -38,18 +38,26 @@ const COMMANDS: &[&str] = &[
     "djinn.openGuide",
 ];
 
+#[derive(Clone)]
 struct Doc {
     text: String,
     version: i32,
 }
 
-#[derive(Default)]
+type SmokeState = Result<SmokeReport, String>;
+
 struct State {
     docs: HashMap<String, Doc>,
-    /// latest smoke report per document uri
-    smoke: HashMap<String, SmokeReport>,
-    /// generation counter per document, to drop stale lint results
-    gen: HashMap<String, u64>,
+    smoke: HashMap<String, SmokeState>,
+    /// Any changed buffer invalidates checks of its dependants as well.
+    revision: u64,
+    agent: String,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self { docs: HashMap::new(), smoke: HashMap::new(), revision: 0, agent: "codex".into() }
+    }
 }
 
 #[derive(Clone)]
@@ -105,7 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     };
     // `Connection::initialize` wraps its argument as the capabilities; to also
     // send serverInfo, answer the initialize request ourselves.
-    let (init_id, _init_params) = connection.initialize_start()?;
+    let (init_id, init_params) = connection.initialize_start()?;
     connection.initialize_finish(
         init_id,
         json!({
@@ -116,7 +124,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
     let bin = std::env::var("DJINN_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("cargo-djinn"))).unwrap_or_else(|| PathBuf::from("cargo-djinn")));
-    let ctx = Ctx { sender: connection.sender.clone(), state: Arc::new(Mutex::new(State::default())), ids: Arc::new(AtomicU64::new(0)), bin };
+    let mut state = State::default();
+    if let Some(agent) = init_params.pointer("/initializationOptions/agent").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        state.agent = agent.to_string();
+    }
+    let ctx = Ctx { sender: connection.sender.clone(), state: Arc::new(Mutex::new(state)), ids: Arc::new(AtomicU64::new(0)), bin };
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -139,30 +151,52 @@ fn main() -> Result<(), Box<dyn std::error::Error + Sync + Send>> {
 
 // ------------------------------------------------------------------ helpers
 
-fn uri_to_path(uri: &Uri) -> PathBuf {
-    let s = uri.as_str();
-    let p = s.strip_prefix("file://").unwrap_or(s);
-    // percent-decoding of the common cases
-    let mut out = String::new();
-    let b = p.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&p[i + 1..i + 3], 16) {
-                out.push(v as char);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(b[i] as char);
-        i += 1;
+/// Decode a local file URI as bytes: widening each percent-decoded UTF-8
+/// byte to a character corrupts every non-ASCII pathname.
+fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    if uri.scheme()?.as_str() != "file" || !uri.path().is_absolute() || uri.query().is_some() || uri.fragment().is_some() {
+        return None;
     }
-    PathBuf::from(out)
+    if let Some(authority) = uri.authority() {
+        if !authority.as_str().is_empty() && !authority.as_str().eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+    }
+    let bytes = uri.path().as_estr().decode().into_bytes().into_owned();
+    if bytes.contains(&0) {
+        return None;
+    }
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(not(unix))]
+    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
+    path.is_absolute().then_some(path)
 }
 
 fn path_to_uri(p: &Path) -> Option<Uri> {
-    let s = p.to_string_lossy().replace(' ', "%20");
-    Uri::from_str(&format!("file://{s}")).ok()
+    if !p.is_absolute() {
+        return None;
+    }
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let bytes = p.to_str()?.as_bytes();
+    let mut uri = String::from("file://");
+    for &b in bytes {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            uri.push(b as char);
+        } else {
+            use std::fmt::Write;
+            write!(uri, "%{b:02X}").ok()?;
+        }
+    }
+    Uri::from_str(&uri).ok()
 }
 
 /// The crate configuration for a document, if the document is one of its
@@ -192,34 +226,49 @@ fn crate_for(path: &Path, text: Option<&str>) -> Option<Config> {
     }
 }
 
-/// The specification's texts with the buffer in place of its file (or
-/// added, if the file is new to the specification), and the buffer's index.
-fn spec_texts_with(cfg: &Config, path: &Path, text: &str) -> (Vec<String>, usize) {
-    let here = path.canonicalize().unwrap_or(path.to_path_buf());
-    let mut texts = Vec::new();
-    let mut idx = None;
-    for f in cfg.specs() {
-        if f.path.canonicalize().unwrap_or(f.path.clone()) == here {
-            idx = Some(texts.len());
-            texts.push(text.to_string());
-        } else {
-            texts.push(std::fs::read_to_string(&f.path).unwrap_or_default());
+/// Overlay every open specification buffer on one coherent document
+/// snapshot, including newly created specification files not yet on disk.
+fn spec_texts_with(cfg: &Config, path: &Path, docs: &HashMap<String, Doc>) -> Result<(Vec<String>, usize), String> {
+    let normalize = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let here = normalize(path);
+    let mut overlays = HashMap::new();
+    for (uri, doc) in docs {
+        if let Some(path) = Uri::from_str(uri).ok().and_then(|u| uri_to_path(&u)) {
+            overlays.insert(normalize(&path), doc.text.clone());
         }
     }
-    let idx = idx.unwrap_or_else(|| {
-        texts.push(text.to_string());
-        texts.len() - 1
-    });
-    (texts, idx)
+    let mut paths: Vec<PathBuf> = cfg.specs().iter().map(|f| normalize(&f.path)).collect();
+    if cfg.spec_manual.is_none() {
+        let src = cfg.crate_dir.join("src");
+        for (p, text) in &overlays {
+            if p.starts_with(&src) && !p.starts_with(src.join("bin")) && djinn_syntax::project::has_djinn(text) && !paths.contains(p) {
+                paths.push(p.clone());
+            }
+        }
+    }
+    if !paths.contains(&here) {
+        paths.push(here.clone());
+    }
+    // Deterministic ordering also keeps dependency diagnostics reproducible.
+    paths.sort();
+    let idx = paths.iter().position(|p| p == &here).unwrap();
+    let texts = paths.iter().map(|p| {
+        overlays.get(p).cloned().map(Ok).unwrap_or_else(|| std::fs::read_to_string(p).map_err(|e| format!("cannot read {}: {e}", p.display())))
+    }).collect::<Result<Vec<_>, _>>()?;
+    Ok((texts, idx))
 }
 
-fn pos(line1: usize, col0: usize) -> Position {
-    Position { line: line1.saturating_sub(1) as u32, character: col0 as u32 }
+/// proc-macro2 source columns count Unicode scalar values; LSP defaults to
+/// UTF-16 code units. Convert using the actual line, including astral text.
+fn pos(text: &str, line1: usize, col0: usize) -> Position {
+    let character = text.lines().nth(line1.saturating_sub(1)).unwrap_or("").chars().take(col0).map(char::len_utf16).sum::<usize>();
+    Position { line: line1.saturating_sub(1) as u32, character: character as u32 }
 }
 
 fn line_range(text: &str, line1: usize) -> Range {
-    let len = text.lines().nth(line1.saturating_sub(1)).map(|l| l.len()).unwrap_or(0);
-    Range { start: pos(line1, 0), end: pos(line1, len) }
+    let line = line1.saturating_sub(1) as u32;
+    let len = text.lines().nth(line as usize).map(|l| l.encode_utf16().count()).unwrap_or(0);
+    Range { start: Position { line, character: 0 }, end: Position { line, character: len as u32 } }
 }
 
 /// Declarations of a document: (name, kind, 1-based line, 0-based column, name length)
@@ -242,39 +291,59 @@ fn find_theorem_line(file: &Path, decl: &str) -> Option<u32> {
 // ----------------------------------------------------------------- handlers
 
 fn handle_notification(ctx: &Ctx, n: Notification) {
-    match n.method.as_str() {
+    let mut st = ctx.state.lock().unwrap();
+    let delay = match n.method.as_str() {
         "textDocument/didOpen" => {
-            let p: DidOpenTextDocumentParams = serde_json::from_value(n.params).unwrap();
-            let uri = p.text_document.uri.as_str().to_string();
-            ctx.state.lock().unwrap().docs.insert(uri.clone(), Doc { text: p.text_document.text, version: p.text_document.version });
-            schedule_lint(ctx, &uri, 0);
+            let Ok(p) = serde_json::from_value::<DidOpenTextDocumentParams>(n.params) else { return };
+            st.docs.insert(p.text_document.uri.as_str().to_string(), Doc { text: p.text_document.text, version: p.text_document.version });
+            0
         }
         "textDocument/didChange" => {
-            let p: DidChangeTextDocumentParams = serde_json::from_value(n.params).unwrap();
-            let uri = p.text_document.uri.as_str().to_string();
-            if let Some(change) = p.content_changes.into_iter().last() {
-                ctx.state.lock().unwrap().docs.insert(uri.clone(), Doc { text: change.text, version: p.text_document.version });
-                schedule_lint(ctx, &uri, 600);
-            }
+            let Ok(p) = serde_json::from_value::<DidChangeTextDocumentParams>(n.params) else { return };
+            let Some(change) = p.content_changes.into_iter().last() else { return };
+            st.docs.insert(p.text_document.uri.as_str().to_string(), Doc { text: change.text, version: p.text_document.version });
+            600
         }
         "textDocument/didSave" => {
-            let p: DidSaveTextDocumentParams = serde_json::from_value(n.params).unwrap();
-            let uri = p.text_document.uri.as_str().to_string();
+            let Ok(p) = serde_json::from_value::<DidSaveTextDocumentParams>(n.params) else { return };
             if let Some(t) = p.text {
-                let mut st = ctx.state.lock().unwrap();
-                let v = st.docs.get(&uri).map(|d| d.version).unwrap_or(0);
-                st.docs.insert(uri.clone(), Doc { text: t, version: v });
+                if let Some(doc) = st.docs.get_mut(p.text_document.uri.as_str()) {
+                    doc.text = t;
+                }
             }
-            schedule_lint(ctx, &uri, 0);
+            0
         }
         "textDocument/didClose" => {
-            let p: DidCloseTextDocumentParams = serde_json::from_value(n.params).unwrap();
-            let uri = p.text_document.uri.as_str().to_string();
-            ctx.state.lock().unwrap().docs.remove(&uri);
+            let Ok(p) = serde_json::from_value::<DidCloseTextDocumentParams>(n.params) else { return };
+            st.docs.remove(p.text_document.uri.as_str());
+            // Send while holding the same lock used to commit lint results.
             ctx.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams { uri: p.text_document.uri, diagnostics: vec![], version: None });
+            0
         }
-        _ => {}
+        "workspace/didChangeConfiguration" => {
+            let Ok(p) = serde_json::from_value::<DidChangeConfigurationParams>(n.params) else { return };
+            if let Some(agent) = p.settings.pointer("/djinn/agent").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                st.agent = agent.to_string();
+                ctx.refresh();
+            }
+            return;
+        }
+        _ => return,
+    };
+    // A changed relation may affect any open caller. Each job captures all
+    // buffers at the same revision, and old revisions cannot publish/cache.
+    invalidate(&mut st);
+    let uris: Vec<String> = st.docs.keys().cloned().collect();
+    drop(st);
+    for uri in uris {
+        schedule_lint(ctx, &uri, delay, false);
     }
+    ctx.refresh();
+}
+
+fn invalidate(st: &mut State) {
+    st.revision += 1;
+    st.smoke.clear();
 }
 
 fn handle_request(ctx: &Ctx, req: Request) {
@@ -304,9 +373,9 @@ fn handle_request(ctx: &Ctx, req: Request) {
 // ------------------------------------------------------------------- status
 
 /// Per-declaration status line and detail, from the last verify report.
-fn status_views(cfg: &Config, path: &Path, text: &str) -> HashMap<String, (String, String)> {
+fn status_views(cfg: &Config, path: &Path, docs: &HashMap<String, Doc>) -> HashMap<String, (String, String)> {
     let report = verify::Report::load(cfg);
-    let (texts, _) = spec_texts_with(cfg, path, text);
+    let Ok((texts, _)) = spec_texts_with(cfg, path, docs) else { return HashMap::new() };
     let views = status::views_text(cfg, report.as_ref(), None, &texts);
     let mut m = HashMap::new();
     for v in views {
@@ -344,8 +413,11 @@ fn status_views(cfg: &Config, path: &Path, text: &str) -> HashMap<String, (Strin
 }
 
 /// The smoke-test verdict for a declaration, with its first counterexample.
-fn smoke_summary(report: Option<&SmokeReport>, name: &str) -> Option<String> {
-    let r = report?;
+fn smoke_summary(report: Option<&SmokeState>, name: &str) -> Option<String> {
+    let r = match report? {
+        Ok(r) => r,
+        Err(e) => return Some(format!("smoke failed: {e}")),
+    };
     let d = r.decls.iter().find(|d| d.name == name)?;
     let mut parts = Vec::new();
     for c in &d.checks {
@@ -367,6 +439,9 @@ fn smoke_summary(report: Option<&SmokeReport>, name: &str) -> Option<String> {
             parts.push(p);
         }
     }
+    if parts.is_empty() && d.checks.iter().any(|c| matches!(c.status, CheckStatus::Unsupported(_))) {
+        return Some("smoke inconclusive".into());
+    }
     if parts.is_empty() && d.checks.iter().all(|c| matches!(c.status, CheckStatus::Skipped)) {
         return Some("smoke skipped".into());
     }
@@ -375,7 +450,7 @@ fn smoke_summary(report: Option<&SmokeReport>, name: &str) -> Option<String> {
 
 /// One label per declaration, shared by the code lens and the inlay hint so
 /// the two can never disagree: (short label, full detail for tooltips).
-fn status_label(views: &HashMap<String, (String, String)>, smoke: Option<&SmokeReport>, name: &str) -> (String, String) {
+fn status_label(views: &HashMap<String, (String, String)>, smoke: Option<&SmokeState>, name: &str) -> (String, String) {
     let (short, detail) = views.get(name).cloned().unwrap_or(("unverified".into(), String::new()));
     let mut label = short.clone();
     match smoke_summary(smoke, name) {
@@ -391,16 +466,16 @@ fn status_label(views: &HashMap<String, (String, String)>, smoke: Option<&SmokeR
 }
 
 fn code_lenses(ctx: &Ctx, uri: &Uri) -> Vec<CodeLens> {
-    let path = uri_to_path(uri);
+    let Some(path) = uri_to_path(uri) else { return vec![] };
     let st = ctx.state.lock().unwrap();
     let Some(doc) = st.docs.get(uri.as_str()) else { return vec![] };
     let Some(cfg) = crate_for(&path, Some(&doc.text)) else { return vec![] };
     let Ok(decls) = decls_of(&doc.text) else { return vec![] };
-    let views = status_views(&cfg, &path, &doc.text);
+    let views = status_views(&cfg, &path, &st.docs);
     let smoke = st.smoke.get(uri.as_str());
     let mut out = Vec::new();
     for (i, (name, _kind, line, col)) in decls.iter().enumerate() {
-        let range = Range { start: pos(*line, *col), end: pos(*line, col + name.len()) };
+        let range = Range { start: pos(&doc.text, *line, *col), end: pos(&doc.text, *line, col + name.chars().count()) };
         let (label, detail) = status_label(&views, smoke, name);
         let title = format!("djinn: {label}");
         let cmd = |title: String, command: &str, args: Vec<Value>| Command { title, command: command.into(), arguments: Some(args) };
@@ -418,12 +493,12 @@ fn code_lenses(ctx: &Ctx, uri: &Uri) -> Vec<CodeLens> {
 }
 
 fn inlay_hints(ctx: &Ctx, uri: &Uri) -> Vec<InlayHint> {
-    let path = uri_to_path(uri);
+    let Some(path) = uri_to_path(uri) else { return vec![] };
     let st = ctx.state.lock().unwrap();
     let Some(doc) = st.docs.get(uri.as_str()) else { return vec![] };
     let Some(cfg) = crate_for(&path, Some(&doc.text)) else { return vec![] };
     let Ok(decls) = decls_of(&doc.text) else { return vec![] };
-    let views = status_views(&cfg, &path, &doc.text);
+    let views = status_views(&cfg, &path, &st.docs);
     let smoke = st.smoke.get(uri.as_str());
     let mut out = Vec::new();
     for (name, _kind, line, _col) in &decls {
@@ -445,72 +520,98 @@ fn inlay_hints(ctx: &Ctx, uri: &Uri) -> Vec<InlayHint> {
 
 // --------------------------------------------------------------------- lint
 
-fn schedule_lint(ctx: &Ctx, uri: &str, delay_ms: u64) {
-    let gen = {
-        let mut st = ctx.state.lock().unwrap();
-        let g = st.gen.entry(uri.to_string()).or_insert(0);
-        *g += 1;
-        *g
-    };
+struct LintResult {
+    diagnostics: Vec<Diagnostic>,
+    smoke: Option<SmokeState>,
+    verdict: &'static str,
+}
+
+impl LintResult {
+    fn empty() -> Self {
+        Self { diagnostics: vec![], smoke: None, verdict: "no specifications to check" }
+    }
+    fn failed(text: &str, message: String) -> Self {
+        Self {
+            diagnostics: vec![Diagnostic { range: line_range(text, 1), severity: Some(DiagnosticSeverity::WARNING), source: Some("djinn smoke-test".into()), message: format!("smoke-test failed: {message}"), ..Default::default() }],
+            smoke: Some(Err(message)),
+            verdict: "failed; see the diagnostics",
+        }
+    }
+}
+
+fn schedule_lint(ctx: &Ctx, uri: &str, delay_ms: u64, announce: bool) {
+    let revision = ctx.state.lock().unwrap().revision;
     let ctx = ctx.clone();
     let uri = uri.to_string();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-        let (text, version) = {
+        let docs = {
             let st = ctx.state.lock().unwrap();
-            if st.gen.get(&uri).copied() != Some(gen) {
+            if st.revision != revision || !st.docs.contains_key(&uri) {
                 return;
             }
-            match st.docs.get(&uri) {
-                Some(d) => (d.text.clone(), d.version),
-                None => return,
-            }
+            st.docs.clone()
         };
+        let doc = &docs[&uri];
         let Ok(u) = Uri::from_str(&uri) else { return };
-        let path = uri_to_path(&u);
-        let Some(cfg) = crate_for(&path, Some(&text)) else { return };
-        let diags = lint(&ctx, &cfg, &uri, &text);
-        if ctx.state.lock().unwrap().gen.get(&uri).copied() != Some(gen) {
-            return;
-        }
-        ctx.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams { uri: u, diagnostics: diags, version: Some(version) });
-        ctx.refresh();
+        let result = match uri_to_path(&u).and_then(|path| crate_for(&path, Some(&doc.text)).map(|cfg| (path, cfg))) {
+            Some((path, cfg)) => lint(&cfg, &u, &path, &docs),
+            None => LintResult::empty(),
+        };
+        commit_lint(&ctx, u, revision, doc.version, result, announce);
     });
 }
 
-fn lint(ctx: &Ctx, cfg: &Config, uri: &str, text: &str) -> Vec<Diagnostic> {
+/// Commit the cache and its diagnostics together. The lock also serializes
+/// this publication with edits and close notifications.
+fn commit_lint(ctx: &Ctx, uri: Uri, revision: u64, version: i32, result: LintResult, announce: bool) {
+    let mut st = ctx.state.lock().unwrap();
+    if st.revision != revision || st.docs.get(uri.as_str()).map(|d| d.version) != Some(version) {
+        return;
+    }
+    let verdict = result.verdict;
+    let success = verdict == "no contradiction and no counterexample within the bounds";
+    match result.smoke {
+        Some(report) => { st.smoke.insert(uri.as_str().to_string(), report); }
+        None => { st.smoke.remove(uri.as_str()); }
+    }
+    ctx.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams { uri, diagnostics: result.diagnostics, version: Some(version) });
+    ctx.refresh();
+    if announce {
+        ctx.show(if success { MessageType::INFO } else { MessageType::WARNING }, format!("smoke-test: {verdict}"));
+    }
+}
+
+fn lint(cfg: &Config, uri: &Uri, path: &Path, docs: &HashMap<String, Doc>) -> LintResult {
+    let text = &docs[uri.as_str()].text;
     let mut diags = Vec::new();
     // syntax and scoping first
     if let Err(e) = djinn_syntax::parse_file(text) {
         let s = e.span.start();
         diags.push(Diagnostic {
-            range: Range { start: pos(s.line, s.column), end: pos(s.line, s.column + 1) },
+            range: Range { start: pos(text, s.line, s.column), end: pos(text, s.line, s.column + 1) },
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("djinn".into()),
             message: e.msg,
             ..Default::default()
         });
-        ctx.state.lock().unwrap().smoke.remove(uri);
-        return diags;
+        return LintResult { diagnostics: diags, smoke: None, verdict: "syntax errors; see the diagnostics" };
     }
     let bounds = smoke::Bounds { timeout_ms: 5_000, ..Default::default() };
     // the whole specification, for what this file uses from the others;
     // findings of this file only
-    let (texts, me) = spec_texts_with(cfg, &uri_to_path(&match Uri::from_str(uri) {
-        Ok(u) => u,
-        Err(_) => return diags,
-    }), text);
+    let (texts, me) = match spec_texts_with(cfg, path, docs) {
+        Ok(sources) => sources,
+        Err(e) => return LintResult::failed(text, e),
+    };
     let mut report = match smoke::smoke_run_sources(&texts, &bounds) {
         Ok(r) => r,
-        Err((_, e)) => {
-            ctx.log(format!("smoke-test failed: {e}"));
-            return diags;
-        }
+        Err((_, e)) => return LintResult::failed(text, e),
     };
     report.decls.retain(|d| d.file == me);
-    let Ok(u) = Uri::from_str(uri) else { return diags };
+    let u = uri;
     for d in &report.decls {
-        let name_range = Range { start: pos(d.line, d.col - 1), end: pos(d.line, d.col - 1 + d.name.len()) };
+        let name_range = Range { start: pos(text, d.line, d.col.saturating_sub(1)), end: pos(text, d.line, d.col.saturating_sub(1) + d.name.chars().count()) };
         for c in &d.checks {
             if let CheckStatus::Problem { what, how_many, examples, conflict_title, conflicts, example_input } = &c.status {
                 let severity = if what.starts_with("ENSURES") { DiagnosticSeverity::WARNING } else { DiagnosticSeverity::ERROR };
@@ -568,8 +669,17 @@ fn lint(ctx: &Ctx, cfg: &Config, uri: &str, text: &str) -> Vec<Diagnostic> {
             }
         }
     }
-    ctx.state.lock().unwrap().smoke.insert(uri.to_string(), report);
-    diags
+    let checked = report.decls.iter().flat_map(|d| &d.checks).collect::<Vec<_>>();
+    let verdict = if checked.iter().any(|c| matches!(c.status, CheckStatus::Problem { .. })) {
+        "findings; see the diagnostics"
+    } else if checked.iter().any(|c| matches!(c.status, CheckStatus::Unsupported(_))) {
+        "inconclusive: some checks could not run within the supported bounds"
+    } else if checked.is_empty() || checked.iter().all(|c| matches!(c.status, CheckStatus::Skipped)) {
+        "skipped: no checks were run"
+    } else {
+        "no contradiction and no counterexample within the bounds"
+    };
+    LintResult { diagnostics: diags, smoke: Some(Ok(report)), verdict }
 }
 
 // ----------------------------------------------------------------- commands
@@ -581,7 +691,7 @@ fn arg_uri(args: &[Value], i: usize) -> Result<Uri, String> {
 
 fn execute(ctx: &Ctx, command: &str, args: &[Value]) -> Result<(), String> {
     let uri = arg_uri(args, 0)?;
-    let path = uri_to_path(&uri);
+    let path = uri_to_path(&uri).ok_or("expected a local file URI")?;
     let text = ctx.state.lock().unwrap().docs.get(uri.as_str()).map(|d| d.text.clone());
     let cfg = crate_for(&path, text.as_deref()).ok_or("this file is not a specification file of a Djinn crate")?;
     match command {
@@ -605,19 +715,10 @@ fn execute(ctx: &Ctx, command: &str, args: &[Value]) -> Result<(), String> {
             Ok(())
         }
         "djinn.smokeTest" => {
-            let text = text.unwrap_or_default();
-            let ctx2 = ctx.clone();
-            let cfg2 = cfg.clone();
-            let u = uri.as_str().to_string();
-            std::thread::spawn(move || {
-                let diags = lint(&ctx2, &cfg2, &u, &text);
-                let problems = diags.len();
-                if let Ok(uu) = Uri::from_str(&u) {
-                    ctx2.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams { uri: uu, diagnostics: diags, version: None });
-                }
-                ctx2.refresh();
-                ctx2.show(if problems == 0 { MessageType::INFO } else { MessageType::WARNING }, if problems == 0 { "smoke-test: no contradiction and no counterexample within the bounds".to_string() } else { format!("smoke-test: {problems} finding(s); see the diagnostics") });
-            });
+            if text.is_none() {
+                return Err("open the specification document before running smoke-test".into());
+            }
+            schedule_lint(ctx, uri.as_str(), 0, true);
             Ok(())
         }
         "djinn.status" => {
@@ -627,7 +728,7 @@ fn execute(ctx: &Ctx, command: &str, args: &[Value]) -> Result<(), String> {
             Ok(())
         }
         "djinn.implement" | "djinn.verify" => {
-            let agent = args.get(1).and_then(|v| v.as_str()).unwrap_or("codex").to_string();
+            let agent = args.get(1).and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| ctx.state.lock().unwrap().agent.clone());
             let manifest = cfg.crate_dir.join("Cargo.toml");
             let bin = ctx.bin.clone();
             let ctx2 = ctx.clone();
@@ -707,4 +808,72 @@ fn run_driver(ctx: &Ctx, bin: &Path, manifest: &Path, is_impl: bool, agent: &str
     let fail_line = last_lines.iter().rev().find(|l| l.starts_with("FAIL")).cloned().unwrap_or_else(|| last_lines.last().cloned().unwrap_or_default());
     ctx.show(if ok { MessageType::INFO } else { MessageType::WARNING }, format!("{title}: {}", if ok { "PASS — every obligation verified".to_string() } else { fail_line }));
     ctx.refresh();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_uris_preserve_unicode_and_reserved_bytes() {
+        let path = Path::new("/tmp/café 😀/#100%?file.rs");
+        let uri = path_to_uri(path).unwrap();
+        assert_eq!(uri.as_str(), "file:///tmp/caf%C3%A9%20%F0%9F%98%80/%23100%25%3Ffile.rs");
+        assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
+        assert_eq!(uri_to_path(&Uri::from_str("file://localhost/tmp/spec.rs").unwrap()).as_deref(), Some(Path::new("/tmp/spec.rs")));
+        assert!(uri_to_path(&Uri::from_str("file://remote/tmp/spec.rs").unwrap()).is_none());
+        assert!(uri_to_path(&Uri::from_str("https://example.com/spec.rs").unwrap()).is_none());
+        assert!(uri_to_path(&Uri::from_str("file:///tmp/spec.rs#fragment").unwrap()).is_none());
+    }
+
+    #[test]
+    fn declaration_and_line_positions_use_utf16() {
+        let text = "djinn! {\n /*😀*/ pub fn café(x: i32) -> r: i32 { r == x; }\n}";
+        let (name, _, line, column) = decls_of(text).unwrap().remove(0);
+        assert_eq!(name, "café");
+        assert_eq!(pos(text, line, column), Position::new(1, 15));
+        assert_eq!(pos(text, line, column + name.chars().count()), Position::new(1, 19));
+        assert_eq!(line_range(text, line).end.character, 49);
+    }
+
+    #[test]
+    fn inconclusive_checks_never_have_an_ok_label() {
+        let report = Ok(SmokeReport {
+            decls: vec![smoke::DeclReport {
+                name: "f".into(), kind: "fn".into(), line: 1, col: 1, file: 0,
+                checks: vec![smoke::CheckReport { label: "consistency".into(), status: CheckStatus::Unsupported("timeout".into()) }],
+            }],
+            all_ok: false,
+        });
+        assert_eq!(smoke_summary(Some(&report), "f").as_deref(), Some("smoke inconclusive"));
+        let failed = Err("cannot run z3".into());
+        assert!(smoke_summary(Some(&failed), "f").unwrap().starts_with("smoke failed:"));
+    }
+
+    #[test]
+    fn obsolete_results_cannot_publish_or_mutate_the_cache() {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        let ctx = Ctx { sender, state: Arc::new(Mutex::new(State::default())), ids: Arc::new(AtomicU64::new(0)), bin: PathBuf::new() };
+        let uri = Uri::from_str("file:///tmp/spec.rs").unwrap();
+        {
+            let mut st = ctx.state.lock().unwrap();
+            st.docs.insert(uri.to_string(), Doc { text: String::new(), version: 2 });
+            st.revision = 2;
+        }
+        commit_lint(&ctx, uri.clone(), 1, 1, LintResult::failed("", "old failure".into()), true);
+        assert!(ctx.state.lock().unwrap().smoke.is_empty());
+        assert!(receiver.try_recv().is_err());
+        commit_lint(&ctx, uri.clone(), 2, 2, LintResult::failed("", "current failure".into()), false);
+        assert!(matches!(ctx.state.lock().unwrap().smoke.get(uri.as_str()), Some(Err(e)) if e == "current failure"));
+        let published: Vec<_> = receiver.try_iter().collect();
+        assert!(published.iter().any(|m| matches!(m, Message::Notification(n) if n.method == "textDocument/publishDiagnostics" && n.params["version"] == 2)));
+        {
+            let mut st = ctx.state.lock().unwrap();
+            st.docs.remove(uri.as_str());
+            invalidate(&mut st);
+        }
+        commit_lint(&ctx, uri, 2, 2, LintResult::failed("", "closed failure".into()), true);
+        assert!(ctx.state.lock().unwrap().smoke.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
 }

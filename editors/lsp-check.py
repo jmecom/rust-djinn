@@ -3,7 +3,7 @@
 
 usage: lsp-check.py <path to rust-djinn-lsp> <spec.rs> [command ...]
 """
-import json, os, subprocess, sys, threading, time
+import json, os, pathlib, subprocess, sys, threading, time
 
 server, spec = sys.argv[1], os.path.abspath(sys.argv[2])
 commands = sys.argv[3:]
@@ -65,7 +65,7 @@ def request(method, params, wait=True):
         time.sleep(0.05)
     return None
 
-uri = "file://" + spec
+uri = pathlib.Path(spec).as_uri()
 init = request("initialize", {"processId": None, "rootUri": None, "capabilities": {"window": {"showDocument": {"support": True}, "workDoneProgress": True}}})
 caps = (init or {}).get("result", {}).get("capabilities", {})
 for key in ("textDocumentSync", "codeLensProvider", "inlayHintProvider", "executeCommandProvider"):

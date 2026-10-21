@@ -15,7 +15,9 @@
 local DJINN_LSP = vim.fn.exepath("rust-djinn-lsp")
 if DJINN_LSP == "" then DJINN_LSP = vim.fn.expand("~/.cargo/bin/rust-djinn-lsp") end
 if vim.fn.executable(DJINN_LSP) == 0 then
-  DJINN_LSP = vim.fn.expand("~/claude/speclang/dafny/aeneas/rust-djinn/target/debug/rust-djinn-lsp")
+  local config_file = debug.getinfo(1, "S").source:sub(2)
+  local checkout = vim.fn.fnamemodify(config_file, ":p:h:h:h")
+  DJINN_LSP = checkout .. "/rust-djinn/target/debug/rust-djinn-lsp"
 end
 local AGENT = "codex" -- or "claude"
 -- The status is drawn on its own line below each function (virtual lines).
@@ -142,7 +144,7 @@ local function enclosing_fn(bufnr)
   local row = vim.api.nvim_win_get_cursor(0)[1]
   for l = row, 1, -1 do
     local line = vim.api.nvim_buf_get_lines(bufnr, l - 1, l, false)[1] or ""
-    local name = line:match("fn%s+([%w_]+)%s*%(")
+    local name = line:match("%f[%w_]fn%s+([%w_]+)%s*%(") or line:match("%f[%w_]rel%s+([%w_]+)%s*%(")
     if name then return name end
   end
 end
@@ -194,6 +196,7 @@ vim.api.nvim_create_autocmd("FileType", {
     vim.lsp.start({
       name = "rust-djinn-lsp",
       cmd = { DJINN_LSP },
+      init_options = { agent = AGENT },
       root_dir = root,
       handlers = { ["workspace/codeLens/refresh"] = on_lens_refresh, ["window/showMessage"] = vim.lsp.handlers["window/showMessage"] },
     })

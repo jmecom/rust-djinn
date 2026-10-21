@@ -86,6 +86,11 @@ async function drawStatus(document) {
   } catch (_) {
     return;
   }
+  // A setting change may arrive while the lens request is in flight.
+  if (statusMode() !== "line") {
+    editors.forEach(clearStatus);
+    return;
+  }
   const byLine = new Map();
   for (const lens of lenses || []) {
     const title = (lens.command && lens.command.title) || "";
@@ -151,6 +156,7 @@ function activate(context) {
   const clientOptions = {
     documentSelector: [{ scheme: "file", language: "rust" }],
     outputChannelName: "Djinn",
+    initializationOptions: { agent: cfg.get("agent") },
     middleware: {
       // VS Code asks for lenses on open, on edits and whenever the server
       // sends workspace/codeLens/refresh (after verify/implement/lint):
@@ -168,7 +174,7 @@ function activate(context) {
       },
       // the server's inline hint says the same as the decoration
       provideInlayHints: (document, range, token, next) =>
-        statusMode() === "line" ? [] : next(document, range, token),
+        statusMode() === "inlayHint" ? next(document, range, token) : [],
     },
   };
   client = new LanguageClient("rust-djinn-lsp", "Djinn for Rust", serverOptions, clientOptions);
@@ -203,6 +209,13 @@ function activate(context) {
     vscode.workspace.onDidSaveTextDocument((doc) => scheduleDraw(doc)),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("djinn.status")) redrawVisible();
+      if ((e.affectsConfiguration("djinn.agent") || e.affectsConfiguration("djinn.status")) && client.isRunning()) {
+        // The server refreshes lenses and hints, clearing any hints that
+        // were already displayed before the status mode changed.
+        client.sendNotification("workspace/didChangeConfiguration", {
+          settings: { djinn: { agent: vscode.workspace.getConfiguration("djinn").get("agent") } },
+        });
+      }
     }),
     ...Object.values(decorations),
   );
