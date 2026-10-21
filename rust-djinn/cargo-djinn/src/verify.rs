@@ -933,7 +933,7 @@ fn aeneas_pipeline_bound(cfg: &Config, log: &mut Log) -> Result<djinn_syntax::ce
     let _ = fs::create_dir_all(cfg.state_dir());
     let llbc = cfg.state_dir().join(format!("{}.llbc", cfg.crate_name));
     let mut charon = Command::new(&cfg.charon);
-    charon.args(["cargo", "--preset=aeneas", "--dest-file"]).arg(&llbc).env("DJINN_VERIFYING", "1").current_dir(&cfg.crate_dir);
+    charon.args(["cargo", "--preset=aeneas", "--no-dedup-serialized-ast", "--dest-file"]).arg(&llbc).env("DJINN_VERIFYING", "1").current_dir(&cfg.crate_dir);
     // the verified program is what the specification names: translation
     // starts from the `fn` stubs and follows their calls (the solution and its
     // helpers); drivers, the workload and any other module of the crate are
@@ -959,6 +959,8 @@ fn aeneas_pipeline_bound(cfg: &Config, log: &mut Log) -> Result<djinn_syntax::ce
     // drivers, which Charon must not even compile
     charon.args(["--", "--lib"]);
     run(&mut charon, "charon", log).map_err(|e| stage("charon", e))?;
+    let llbc_json: serde_json::Value = serde_json::from_slice(&fs::read(&llbc).map_err(|e| stage("trusted models", e.to_string()))?).map_err(|e| stage("trusted models", e.to_string()))?;
+    crate::models::validate_usage(&llbc_json).map_err(|e| stage("trusted models", e))?;
     // 3. aeneas, regenerating Code/ from scratch
     let code_dir = cfg.lean_dir().join("Code");
     let _ = fs::remove_dir_all(&code_dir);

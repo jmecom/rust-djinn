@@ -7,8 +7,12 @@
 //! `FunsExternal.lean` / `TypesExternal.lean` from this library and goes on;
 //! anything uncovered is a failure with an explanation (DESIGN.md §6, §7).
 //!
-//! These definitions are part of the trusted computing base: they assert
-//! that the Rust functions behave like the Lean bodies below.
+//! Trusted models require `validate_usage` on the resolved IR: maps support
+//! integer keys with standard hashers; direct hashing is rejected. Input
+//! certification also rejects user crates impersonating modeled crates.
+
+mod usage;
+pub use usage::validate_usage;
 
 /// A modeled item: Aeneas's name pattern and its Lean definition.
 pub struct Model {
@@ -16,7 +20,7 @@ pub struct Model {
     pub lean: &'static str,
 }
 
-/// The scalar types `HashMap` keys may have; their `Hash` instances are trivial models.
+/// The integer key types supported by the restricted `HashMap` abstraction.
 const HASH_SCALARS: &[(&str, &str)] = &[
     ("u8", "U8"), ("u16", "U16"), ("u32", "U32"), ("u64", "U64"), ("u128", "U128"), ("usize", "Usize"),
     ("i8", "I8"), ("i16", "I16"), ("i32", "I32"), ("i64", "I64"), ("i128", "I128"), ("isize", "Isize"),
@@ -75,8 +79,9 @@ pub const TYPES: &[Model] = &[
     Model {
         pattern: "std::collections::hash::map::HashMap",
         lean: r#"/-- `std::collections::HashMap<K, V>`, modeled as an association list: the
-    entries in insertion order, no key twice. Hashing is irrelevant to the
-    model; equality of keys is Rust's `Eq` instance, passed to every operation. -/
+    entries in insertion order, no key twice. validate_usage restricts keys
+    and queries to the same integer type, with RandomState and Global, so
+    omitting hashing cannot erase custom Hash/Eq/Borrow/BuildHasher callbacks. -/
 @[rust_type "std::collections::hash::map::HashMap"]
 structure std.collections.hash.map.HashMap (K : Type) (V : Type) (S : Type) (A : Type) where
   entries : List (K × V)
@@ -100,18 +105,20 @@ structure memchr.memchr.Memchr where
 /// Function models (`FunsExternal.lean`); the hashing models for the scalar
 /// key types are generated (`hash_models`).
 pub const FUNS: &[Model] = &[
-    // ---- hashing: irrelevant to the association-list model
+    // Map dictionary placeholders fail even if a direct call escapes validate_usage.
+    // Aeneas's two-method Hasher trait omits Rust's independent write_u* overrides,
+    // so it cannot support a faithful generic hashing model.
     Model {
         pattern: "std::hash::random::{core::hash::Hasher<std::hash::random::DefaultHasher>}::finish",
-        lean: "def std.hash.random.DefaultHasher.Insts.CoreHashHasher.finish\n  : std.hash.random.DefaultHasher → Result Std.U64 := fun _ => ok 0#u64\n",
+        lean: "def std.hash.random.DefaultHasher.Insts.CoreHashHasher.finish\n  : std.hash.random.DefaultHasher → Result Std.U64 := fun _ => fail .undef\n",
     },
     Model {
         pattern: "std::hash::random::{core::hash::Hasher<std::hash::random::DefaultHasher>}::write",
-        lean: "def std.hash.random.DefaultHasher.Insts.CoreHashHasher.write\n  : std.hash.random.DefaultHasher → Slice Std.U8 → Result std.hash.random.DefaultHasher := fun h _ => ok h\n",
+        lean: "def std.hash.random.DefaultHasher.Insts.CoreHashHasher.write\n  : std.hash.random.DefaultHasher → Slice Std.U8 → Result std.hash.random.DefaultHasher := fun _ _ => fail .undef\n",
     },
     Model {
         pattern: "std::hash::random::{core::hash::BuildHasher<std::hash::random::RandomState, std::hash::random::DefaultHasher>}::build_hasher",
-        lean: "def std.hash.random.RandomState.Insts.CoreHashBuildHasherDefaultHasher.build_hasher\n  : std.hash.random.RandomState → Result std.hash.random.DefaultHasher := fun _ => ok .mk\n",
+        lean: "def std.hash.random.RandomState.Insts.CoreHashBuildHasherDefaultHasher.build_hasher\n  : std.hash.random.RandomState → Result std.hash.random.DefaultHasher := fun _ => fail .undef\n",
     },
     // ---- small conversions the map API drags in
     Model {
@@ -215,14 +222,14 @@ pub const FUNS: &[Model] = &[
     },
 ];
 
-/// The hashing models for the scalar key types.
+/// Failing placeholders for scalar hash dictionaries used by supported maps.
 fn hash_models() -> Vec<(String, String)> {
     HASH_SCALARS
         .iter()
         .map(|(rust, lean)| {
             (
                 format!("core::hash::impls::{{core::hash::Hash<{rust}>}}::hash"),
-                format!("def {lean}.Insts.CoreHashHash.hash\n  {{H : Type}} (HasherInst : core.hash.Hasher H) : Std.{lean} → H → Result H := fun _ h => ok h\n"),
+                format!("def {lean}.Insts.CoreHashHash.hash\n  {{H : Type}} (HasherInst : core.hash.Hasher H) : Std.{lean} → H → Result H := fun _ _ => fail .undef\n"),
             )
         })
         .collect()

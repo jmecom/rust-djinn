@@ -375,11 +375,17 @@ in a scratch file before building a proof on them.
   value back. `memchr::memchr_iter(n, s).count()` is modeled too: the
   iterator is the pair `⟨n, s⟩` and its `count` is `List.count n s.val`
   (`unfold` both models; it is one SIMD pass in Rust, where a loop of
-  `memchr` calls stops at every match). Add `memchr = "2"` to the crate's
-  dependencies if it is not there (it is in `grep-searcher`).
+  `memchr` calls stops at every match). The current certificate policy
+  rejects runtime `memchr` dependencies until their source identity and
+  compiler configuration can be certified.
 - **Maps.** `HashMap<K, V>` is modeled as `⟨entries⟩`, an association list
   without duplicate keys; the specification sees `m.entries` and
-  `Djinn.Vocab.mapGet m k`. The Rust methods `new`, `insert`, `get`,
+  `Djinn.Vocab.mapGet m k`. Keys and borrowed queries must have the same
+  concrete integer type, with `RandomState` and the global allocator. Charon's
+  resolved types and function references enforce this boundary: custom or
+  unresolved `Hash`, `Eq`, `Borrow`, and `BuildHasher` callbacks are unsupported.
+  Direct hashing calls are rejected; dictionary placeholders fail.
+  The Rust methods `new`, `insert`, `get`,
   `contains_key`, `remove`, `len`, `is_empty` have models built on
   `Djinn.Vocab.find` with Rust's `Eq` instance. For scalar keys, after
   unfolding the model (`unfold std.collections.hash.map.HashMap.get
