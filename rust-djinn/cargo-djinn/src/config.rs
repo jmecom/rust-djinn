@@ -119,7 +119,8 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
         .map(|p| if p.as_os_str().is_empty() { PathBuf::from(".") } else { p.to_path_buf() })
         .unwrap();
     let crate_dir = crate_dir.canonicalize().map_err(|e| format!("{}: {e}", crate_dir.display()))?;
-    let crate_name = toml["package"]["name"].as_str().ok_or("package.name missing")?.to_string();
+    let crate_name = toml.get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str())
+        .ok_or("package.name missing (a virtual workspace is not a Djinn package)")?.to_string();
     let meta = toml
         .get("package")
         .and_then(|p| p.get("metadata"))
@@ -139,7 +140,26 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
     if ["Sort", "Type", "Prop", "List", "Option", "Result", "Aeneas", "Std", "Lean", "Mathlib"].contains(&ns.as_str()) {
         return Err(format!("namespace `{ns}` clashes with a Lean keyword or library; set [package.metadata.djinn] namespace"));
     }
-    let work_dir = crate_dir.join(get("work_dir").unwrap_or_else(|| "djinn".into()));
+    let work_rel = get("work_dir").unwrap_or_else(|| "djinn".into());
+    validate_relative_path(Path::new(&work_rel), "work_dir")?;
+    let work_dir = crate_dir.join(&work_rel);
+    let proofs = get("proofs").map(|p| {
+        validate_relative_path(Path::new(&p), "proofs")?;
+        Ok::<_, String>(crate_dir.join(p))
+    }).transpose()?.unwrap_or_else(|| work_dir.join("proofs"));
+    validate_relative_path(Path::new(&ns), "namespace")?;
+    if Path::new(&ns).components().count() != 1 {
+        return Err("namespace must be a single Lean namespace identifier".into());
+    }
+    for (name, path) in [("work_dir", &work_dir), ("proofs", &proofs)] {
+        if path.starts_with(crate_dir.join(".djinnscratch")) {
+            return Err(format!("{name} must not be inside .djinnscratch"));
+        }
+    }
+    let sol = work_dir.join("solution");
+    if sol.starts_with(&proofs) || proofs.starts_with(&sol) {
+        return Err("solution and proofs directories must not overlap".into());
+    }
     let lake_packages = get("lake_packages")
         .map(|p| crate_dir.join(p))
         .or_else(|| env("DJINN_LAKE_PACKAGES").map(PathBuf::from))
@@ -153,10 +173,7 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
             Some(toml::Value::Array(a)) => Some(a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect()),
             _ => None,
         },
-        proofs: match get("proofs") {
-            Some(p) => crate_dir.join(p),
-            None => work_dir.join("proofs"),
-        },
+        proofs,
         work_dir,
         lake_packages,
         aeneas_lean: get("aeneas_lean").or_else(|| env("DJINN_AENEAS_LEAN")),
@@ -168,6 +185,14 @@ pub fn load_config(manifest: &Path) -> Result<Config, String> {
         crate_name,
         ns,
     })
+}
+
+/// Mirrored paths must have an unambiguous, nonempty spelling beneath their root.
+pub(crate) fn validate_relative_path(path: &Path, what: &str) -> Result<(), String> {
+    if path.as_os_str().is_empty() || path.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Err(format!("{what} must be a nonempty relative path without `.` or `..`: {}", path.display()));
+    }
+    Ok(())
 }
 
 /// A tool path given relative to the crate directory becomes absolute; a bare

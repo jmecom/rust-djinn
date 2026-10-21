@@ -98,7 +98,7 @@ pub const ALLOWED_TOOLS: &[&str] = &[
     "Bash(sed *)", "Bash(awk *)", "Bash(diff *)", "Bash(sort *)", "Bash(uniq *)", "Bash(echo *)", "Bash(python3 *)", "Bash(cp *)", "Bash(mv *)", "Bash(mkdir *)",
 ];
 
-fn sh_quote(s: &str) -> String {
+pub(crate) fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
@@ -156,27 +156,7 @@ that no longer exist have already been archived away). Current status:\n\n",
 /// derived files (Aeneas model, name table, report). Used by `-B` and `clean`.
 pub fn reset_work(cfg: &Config) -> Result<std::path::PathBuf, String> {
     ensure_no_running_job(cfg)?;
-    let backup = cfg.state_dir().join("backup").join(id_time(now()));
-    fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
-    let sol = cfg.solution_dir();
-    if sol.exists() {
-        let _ = fs::rename(&sol, backup.join("solution"));
-    }
-    fs::create_dir_all(&sol).map_err(|e| e.to_string())?;
-    fs::write(sol.join("mod.rs"), "//! LLM-owned.\n").map_err(|e| e.to_string())?;
-    let proofs = cfg.lean_dir().join("Proofs.lean");
-    if proofs.exists() {
-        let _ = fs::rename(&proofs, backup.join("Proofs.lean"));
-    }
-    let helpers = cfg.lean_dir().join("Proofs");
-    if helpers.exists() {
-        let _ = fs::rename(&helpers, backup.join("Proofs"));
-    }
-    // the Aeneas model of the old implementation must not leak into the new run
-    let _ = fs::remove_dir_all(cfg.lean_dir().join("Code"));
-    let _ = fs::remove_file(cfg.translation_path());
-    let _ = fs::remove_file(verify::Report::path(cfg));
-    Ok(backup)
+    crate::jail::archive_work(cfg)
 }
 
 /// A backup directory's contents in one line.
@@ -295,11 +275,11 @@ fn run_script(jail: &Path, argv: &[String], log: &Path) -> String {
     format!(
         "#!/bin/bash\n# how the agent was invoked; re-run with `bash run.sh`\ncd {jail}\n\
 if [ -n \"$DJINN_DRIVER_PID\" ]; then\n\
-  ( while kill -0 \"$DJINN_DRIVER_PID\" 2>/dev/null; do sleep 2; done; echo driver-died > exit-code; date +%s > ended; kill -TERM -$$ 2>/dev/null; sleep 2; kill -KILL -$$ 2>/dev/null ) &\n\
+  ( trap '' TERM; while kill -0 \"$DJINN_DRIVER_PID\" 2>/dev/null; do sleep 2; done; echo driver-died > exit-code; date +%s > ended; kill -TERM -$$ 2>/dev/null; sleep 2; kill -KILL -$$ 2>/dev/null ) &\n\
   WATCHDOG=$!\n\
 fi\n\
 date +%s > started\n{cmd} < PROMPT.md 2>&1 | tee -a {log}\necho \"${{PIPESTATUS[0]}}\" > exit-code\ndate +%s > ended\n\
-[ -n \"$WATCHDOG\" ] && kill \"$WATCHDOG\" 2>/dev/null\nexit 0\n",
+[ -n \"$WATCHDOG\" ] && kill -KILL \"$WATCHDOG\" 2>/dev/null\nexit 0\n",
         jail = sh_quote(&jail.to_string_lossy()),
         cmd = argv.iter().map(|a| sh_quote(a)).collect::<Vec<_>>().join(" "),
         log = sh_quote(&log.to_string_lossy())
@@ -735,4 +715,54 @@ pub fn run_foreground(cfg: &Config, opts: &Opts, prompt: &str, bin: &Path, stop:
     let _ = mon.join();
     let usage = status::summarize_log(&log_path, job.model.as_deref());
     Ok(AgentRun { job, exit_ok, interrupted, usage })
+}
+
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    struct Processes { group: Option<std::process::Child>, driver: std::process::Child, dir: std::path::PathBuf }
+    impl Drop for Processes {
+        fn drop(&mut self) {
+            if let Some(child) = self.group.as_mut() {
+                let _ = Command::new("kill").args(["-KILL", &format!("-{}", child.id())]).output();
+                let _ = child.wait();
+            }
+            let _ = self.driver.kill();
+            let _ = self.driver.wait();
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn watchdog_kills_term_ignoring_agent_and_descendant_after_driver_death() {
+        let dir = std::env::temp_dir().join(format!("djinn-watchdog-test-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("PROMPT.md"), "").unwrap();
+        fs::write(dir.join("fake.sh"), "trap '' TERM\necho $$ > agent.pid\nbash -c 'trap \"\" TERM; echo $$ > descendant.pid; while :; do sleep 1; done' &\nwait\n").unwrap();
+        let driver = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut processes = Processes { group: None, driver, dir: dir.clone() };
+        let script = run_script(&dir, &["bash".into(), "fake.sh".into()], &dir.join("agent.log"));
+        fs::write(dir.join("run.sh"), script).unwrap();
+        processes.group = Some(Command::new("bash").arg(dir.join("run.sh")).env("DJINN_DRIVER_PID", processes.driver.id().to_string()).process_group(0).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.join("descendant.pid").exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(20)); }
+        let agent = fs::read_to_string(dir.join("agent.pid")).unwrap();
+        let descendant = fs::read_to_string(dir.join("descendant.pid")).unwrap();
+        processes.driver.kill().unwrap();
+        processes.driver.wait().unwrap();
+        let alive = |pid: &str| Command::new("ps").args(["-p", pid.trim(), "-o", "stat="]).output().map(|o| {
+            let state = String::from_utf8_lossy(&o.stdout);
+            o.status.success() && !state.trim().is_empty() && !state.trim().starts_with('Z')
+        }).unwrap_or(false);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while (alive(&agent) || alive(&descendant)) && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(50)); }
+        assert!(!alive(&agent), "agent survived its driver's death");
+        assert!(!alive(&descendant), "descendant survived its driver's death");
+        assert_eq!(fs::read_to_string(dir.join("exit-code")).unwrap().trim(), "driver-died");
+    }
+
 }

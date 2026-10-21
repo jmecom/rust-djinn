@@ -26,40 +26,94 @@ pub fn proofs_in(cfg: &Config, jail: &Path) -> PathBuf {
     jail.join(cfg.proofs_rel())
 }
 
-fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-    for e in fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))?.flatten() {
-        let p = e.path();
-        let name = e.file_name();
-        if name == ".lake" || name == "target" || name == ".djinn" {
-            continue;
-        }
-        let d = dst.join(&name);
-        if p.is_dir() {
-            copy_dir(&p, &d)?;
-        } else {
-            fs::copy(&p, &d).map_err(|e| format!("{}: {e}", p.display()))?;
-        }
+mod safe_fs;
+use safe_fs::Dir;
+
+fn relative(cfg: &Config, path: &Path) -> Result<PathBuf, String> {
+    let rel = path.strip_prefix(&cfg.crate_dir).map_err(|_| format!("mirrored path must be inside the crate: {}", path.display()))?;
+    validate_relative_path(rel, "mirrored path")?;
+    Ok(rel.to_owned())
+}
+
+fn validate_layout(cfg: &Config) -> Result<(), String> {
+    relative(cfg, &cfg.solution_dir())?;
+    relative(cfg, &cfg.proofs)?;
+    validate_relative_path(Path::new(&cfg.ns), "namespace")?;
+    if Path::new(&cfg.ns).components().count() != 1 {
+        return Err("namespace must be a single path component".into());
     }
+    let sol = cfg.solution_dir();
+    if sol.starts_with(&cfg.proofs) || cfg.proofs.starts_with(&sol)
+        || sol.starts_with(cfg.state_dir()) || cfg.proofs.starts_with(cfg.state_dir()) {
+        return Err("solution, proofs, and scratch directories must not overlap".into());
+    }
+    for spec in cfg.specs() { relative(cfg, &spec.path)?; }
     Ok(())
 }
 
-fn set_readonly(p: &Path, ro: bool) {
-    if let Ok(md) = fs::metadata(p) {
-        let mut perm = md.permissions();
-        perm.set_readonly(ro);
-        let _ = fs::set_permissions(p, perm);
+fn roots(cfg: &Config, jail: &Path) -> Result<(Dir, Dir), String> {
+    validate_layout(cfg)?;
+    let jail = jail.canonicalize().map_err(|e| format!("{}: {e}", jail.display()))?;
+    let real = cfg.crate_dir.canonicalize().map_err(|e| e.to_string())?;
+    if real.starts_with(&jail) || jail.starts_with(cfg.solution_dir()) || jail.starts_with(&cfg.proofs) {
+        return Err("jail must be distinct from the crate and its solution/proofs directories".into());
     }
+    Ok((Dir::open(&real).map_err(|e| e.to_string())?, Dir::open(&jail).map_err(|e| e.to_string())?))
 }
 
-fn set_readonly_tree(p: &Path, ro: bool) {
-    if p.is_dir() {
-        for e in fs::read_dir(p).into_iter().flatten().flatten() {
-            set_readonly_tree(&e.path(), ro);
+fn sh_quote(path: &Path) -> String {
+    crate::agent::sh_quote(&path.to_string_lossy())
+}
+
+/// Reserve an archive atomically, and move all owned paths before creating a
+/// fresh stub. If any move fails, undo the preceding moves in reverse order.
+pub(crate) fn archive_work(cfg: &Config) -> Result<PathBuf, String> {
+    validate_layout(cfg)?;
+    let root = Dir::open(&cfg.crate_dir).map_err(|e| e.to_string())?;
+    let backup_root = relative(cfg, &cfg.state_dir().join("backup"))?;
+    let backup = (0u64..).find_map(|n| {
+        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let path = backup_root.join(format!("{}-{:09}-{}-{n:020}", id_time(time.as_secs()), time.subsec_nanos(), std::process::id()));
+        match root.create_dir(&path) {
+            Ok(()) => Some(Ok(path)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(e) => Some(Err(e.to_string())),
         }
-    } else {
-        set_readonly(p, ro);
+    }).unwrap()?;
+    let sol = relative(cfg, &cfg.solution_dir())?;
+    let lean = relative(cfg, &cfg.lean_dir())?;
+    let paths = [(sol.clone(), "solution"), (lean.join("Proofs.lean"), "Proofs.lean"), (lean.join("Proofs"), "Proofs")];
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let result = (|| {
+        for (path, name) in paths {
+            if root.exists(&path).map_err(|e| e.to_string())? {
+                let dest = backup.join(name);
+                root.move_path(&path, &dest).map_err(|e| format!("cannot archive {}: {e}", path.display()))?;
+                moved.push((path, dest));
+            }
+        }
+        root.write(&sol.join("mod.rs"), b"//! LLM-owned.\n".as_slice(), 0o644).map_err(|e| e.to_string())
+    })();
+    if let Err(error) = result {
+        let mut failures = Vec::new();
+        // Only a newly created stub directory may be removed here. If the
+        // solution move itself failed, the original is still in place.
+        if moved.iter().any(|(path, _)| path == &sol) {
+            if let Err(e) = root.remove(&sol) { failures.push(e.to_string()); }
+        }
+        for (path, dest) in moved.into_iter().rev() {
+            if let Err(e) = root.move_path(&dest, &path) { failures.push(format!("{}: {e}", path.display())); }
+        }
+        if failures.is_empty() {
+            let _ = root.remove(&backup);
+            return Err(error);
+        }
+        return Err(format!("{error}; rollback failed: {}; retained archive: {}", failures.join("; "), cfg.crate_dir.join(&backup).display()));
     }
+    for path in [lean.join("Code"), relative(cfg, &cfg.translation_path())?, relative(cfg, &crate::verify::Report::path(cfg))?] {
+        root.remove(&path).map_err(|e| format!("archived work to {}, but cannot remove {}: {e}", cfg.crate_dir.join(&backup).display(), path.display()))?;
+    }
+    Ok(cfg.crate_dir.join(backup))
 }
 
 /// Cargo.toml for the jail: path dependencies and tool paths made absolute.
@@ -104,82 +158,56 @@ fn jail_cargo_toml(cfg: &Config) -> Result<String, String> {
 
 /// Create a fresh jail for an agent run. Returns its directory.
 pub fn create(cfg: &Config, id: &str, bin: &Path) -> Result<PathBuf, String> {
+    validate_layout(cfg)?;
+    validate_relative_path(Path::new(id), "jail identifier")?;
+    if Path::new(id).components().count() != 1 {
+        return Err("jail identifier must be a single path component".into());
+    }
     let dir = jails_dir(cfg).join(id);
-    if dir.exists() {
-        return Err(format!("jail {} already exists", dir.display()));
+    let real = Dir::open(&cfg.crate_dir).map_err(|e| e.to_string())?;
+    real.create_dir(&relative(cfg, &dir)?).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let jail = real.subdir(&relative(cfg, &dir)?, false).map_err(|e| e.to_string())?;
+    jail.write(Path::new("Cargo.toml"), jail_cargo_toml(cfg)?.as_bytes(), 0o644).map_err(|e| e.to_string())?;
+    jail.copy_tree(&real, Path::new("src")).map_err(|e| e.to_string())?;
+    let sol = relative(cfg, &cfg.solution_dir())?;
+    if real.exists(&sol).map_err(|e| e.to_string())? {
+        jail.copy_tree(&real, &sol).map_err(|e| e.to_string())?;
     }
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    // Rust side: the crate's layout, with the solution directory in place
-    fs::write(dir.join("Cargo.toml"), jail_cargo_toml(cfg)?).map_err(|e| e.to_string())?;
-    copy_dir(&cfg.crate_dir.join("src"), &dir.join("src"))?;
-    let jsol = sol_in(cfg, &dir);
-    if cfg.solution_dir().is_dir() {
-        copy_dir(&cfg.solution_dir(), &jsol)?;
+    jail.subdir(&sol, true).map_err(|e| e.to_string())?;
+    let proofs = relative(cfg, &cfg.proofs)?;
+    jail.copy_tree(&real, &proofs).map_err(|e| e.to_string())?;
+    let packages = cfg.proofs.join(".lake/packages");
+    if let Ok(packages) = packages.canonicalize() {
+        jail.symlink(&packages, &proofs.join(".lake/packages")).map_err(|e| e.to_string())?;
     }
-    fs::create_dir_all(&jsol).map_err(|e| e.to_string())?;
-    // Lean side (without .lake; packages shared read-only through a symlink)
-    let jproofs = proofs_in(cfg, &dir);
-    copy_dir(&cfg.proofs, &jproofs)?;
-    let pk = cfg.proofs.join(".lake").join("packages");
-    if let Ok(real) = pk.canonicalize() {
-        let jl = jproofs.join(".lake");
-        fs::create_dir_all(&jl).map_err(|e| e.to_string())?;
-        let _ = std::os::unix::fs::symlink(&real, jl.join("packages"));
-    }
-    // the project's own build artifacts (Spec, Code, Obligations oleans), so
-    // that `lake env lean` works before the first `lake build`; Lake's trace
-    // hashes make it rebuild whatever differs
-    let bd = cfg.proofs.join(".lake").join("build");
-    if bd.is_dir() {
-        copy_dir(&bd, &jproofs.join(".lake").join("build"))?;
-    }
-    // the lakefile's `require aeneas from "<relative>"` (and the manifest's copy
-    // of that path) must resolve from the jail
     if let Some(al) = &cfg.aeneas_lean {
         if let Ok(abs) = cfg.proofs.join(al).canonicalize() {
-            for f in ["lakefile.lean", "lake-manifest.json"] {
-                let lf = jproofs.join(f);
-                if let Ok(t) = fs::read_to_string(&lf) {
-                    let _ = fs::write(&lf, t.replace(&format!("\"{al}\""), &format!("\"{}\"", abs.display())));
+            for name in ["lakefile.lean", "lake-manifest.json"] {
+                let path = proofs.join(name);
+                if let Ok(bytes) = jail.read(&path) {
+                    let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                    let text = text.replace(&format!("\"{al}\""), &format!("\"{}\"", abs.display()));
+                    jail.write(&path, text.as_bytes(), 0o644).map_err(|e| e.to_string())?;
                 }
             }
         }
-    }
-    // the guide and Aeneas's name table, at the jail's root
-    if cfg.guide_path().exists() {
-        fs::copy(cfg.guide_path(), dir.join("GUIDE.md")).map_err(|e| e.to_string())?;
-    }
-    if cfg.translation_path().exists() {
-        let _ = fs::copy(cfg.translation_path(), dir.join("translation.json"));
     }
     // tools for the agent
     let bin = bin.canonicalize().map_err(|e| e.to_string())?;
     let manifest = cfg.crate_dir.join("Cargo.toml");
     let script = |cmd: &str| {
         format!(
-            "#!/bin/sh\n# {cmd} the real crate from this jail (only the solution directory and Proofs.lean are taken back).\nexec '{}' {cmd} --jail '{}' --manifest-path '{}' \"$@\"\n",
-            bin.display(),
-            dir.display(),
-            manifest.display()
+            "#!/bin/sh\n# {cmd} the real crate from this jail (only the solution directory and Proofs.lean are taken back).\nexec {} {cmd} --jail {} --manifest-path {} \"$@\"\n",
+            sh_quote(&bin),
+            sh_quote(&dir),
+            sh_quote(&manifest)
         )
     };
-    for (name, cmd) in [("verify", "verify"), ("status", "status")] {
-        let p = dir.join(name);
-        fs::write(&p, script(cmd)).map_err(|e| e.to_string())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
-        }
+    for cmd in ["verify", "status"] {
+        jail.write(Path::new(cmd), script(cmd).as_bytes(), 0o755).map_err(|e| e.to_string())?;
     }
-    // `./bench` times the jail's own copy (its Cargo.toml has absolute paths)
-    let bench = format!("#!/bin/sh\n# time the performance workload of this jail's copy of the crate\nexec '{}' bench --manifest-path '{}/Cargo.toml' \"$@\"\n", bin.display(), dir.display());
-    fs::write(dir.join("bench"), bench).map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dir.join("bench"), fs::Permissions::from_mode(0o755));
-    }
+    let bench = format!("#!/bin/sh\n# time this jail's performance workload\nexec {} bench --manifest-path {} \"$@\"\n", sh_quote(&bin), sh_quote(&dir.join("Cargo.toml")));
+    jail.write(Path::new("bench"), bench.as_bytes(), 0o755).map_err(|e| e.to_string())?;
     let mcp = serde_json::json!({
         "mcpServers": {
             "djinn": {
@@ -188,71 +216,47 @@ pub fn create(cfg: &Config, id: &str, bin: &Path) -> Result<PathBuf, String> {
             }
         }
     });
-    fs::write(dir.join(".mcp.json"), serde_json::to_string_pretty(&mcp).unwrap()).map_err(|e| e.to_string())?;
+    jail.write(Path::new(".mcp.json"), serde_json::to_string_pretty(&mcp).unwrap().as_bytes(), 0o644).map_err(|e| e.to_string())?;
     let pointer = format!(
         "# Djinn jail\n\nRead `GUIDE.md` (this directory) before doing anything else. You may edit only\n`{sol}/` and `{p}/{ns}/Proofs.lean` (plus helper files under\n`{p}/{ns}/Proofs/`). Everything else is regenerated by the verifier and\nedits to it are discarded. Judge your work with the `verify` tool\n(MCP server `djinn`), or `./verify` from this directory.\n",
         ns = cfg.ns,
         sol = cfg.sol_rel(),
         p = cfg.proofs_rel()
     );
-    fs::write(dir.join("CLAUDE.md"), &pointer).map_err(|e| e.to_string())?;
-    fs::write(dir.join("AGENTS.md"), &pointer).map_err(|e| e.to_string())?;
-    protect(cfg, &dir);
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        jail.write(Path::new(name), pointer.as_bytes(), 0o444).map_err(|e| e.to_string())?;
+    }
+    sync_forward(cfg, &dir)?;
     Ok(dir)
-}
-
-/// Mark the non-owned files read-only (a reminder, not a security boundary).
-fn protect(cfg: &Config, jail: &Path) {
-    for f in cfg.specs() {
-        set_readonly_tree(&jail.join(cfg.rel(&f.path)), true);
-    }
-    let jp = proofs_in(cfg, jail);
-    let ld = jp.join(&cfg.ns);
-    for f in ["Spec.lean", "Obligations.lean", "Audit.lean"] {
-        set_readonly(&ld.join(f), true);
-    }
-    set_readonly_tree(&ld.join("Code"), true);
-    set_readonly(&jail.join("GUIDE.md"), true);
 }
 
 /// Take the LLM-owned paths from the jail into the real crate.
 pub fn sync_back(cfg: &Config, jail: &Path) -> Result<Vec<String>, String> {
+    let (real, jailed) = roots(cfg, jail)?;
     let mut notes = Vec::new();
-    // the solution directory: mirror
-    let js = sol_in(cfg, jail);
-    let rs = cfg.solution_dir();
-    if js.exists() {
-        let _ = fs::remove_dir_all(&rs);
-        copy_dir(&js, &rs)?;
+    let sol = relative(cfg, &cfg.solution_dir())?;
+    if jailed.exists(&sol).map_err(|e| e.to_string())? {
+        real.mirror_tree(&jailed, &sol, false).map_err(|e| format!("cannot sync solution: {e}"))?;
         notes.push(format!("synced {} from the jail", cfg.sol_rel()));
     }
-    // <proofs>/<NS>/Proofs.lean and Proofs/
-    let jp = proofs_in(cfg, jail).join(&cfg.ns);
-    let rp = cfg.lean_dir();
-    fs::create_dir_all(&rp).map_err(|e| e.to_string())?;
-    if jp.join("Proofs.lean").exists() {
-        fs::copy(jp.join("Proofs.lean"), rp.join("Proofs.lean")).map_err(|e| e.to_string())?;
+    let lean = relative(cfg, &cfg.lean_dir())?;
+    let proofs = lean.join("Proofs.lean");
+    if jailed.exists(&proofs).map_err(|e| e.to_string())? {
+        real.copy_file(&jailed, &proofs, &proofs, false).map_err(|e| e.to_string())?;
         notes.push(format!("synced {}/{}/Proofs.lean from the jail", cfg.proofs_rel(), cfg.ns));
     }
-    if jp.join("Proofs").is_dir() {
-        let _ = fs::remove_dir_all(rp.join("Proofs"));
-        copy_dir(&jp.join("Proofs"), &rp.join("Proofs"))?;
+    let helpers = lean.join("Proofs");
+    if jailed.exists(&helpers).map_err(|e| e.to_string())? {
+        real.mirror_tree(&jailed, &helpers, false).map_err(|e| e.to_string())?;
         notes.push(format!("synced {}/{}/Proofs/ from the jail", cfg.proofs_rel(), cfg.ns));
     }
     // anything else the agent touched is ignored; say so for the spec
-    let specs = cfg.specs();
-    for f in &specs {
-        if let (Ok(a), Ok(b)) = (fs::read(jail.join(cfg.rel(&f.path))), fs::read(&f.path)) {
+    for f in cfg.specs() {
+        let path = relative(cfg, &f.path)?;
+        if let (Ok(a), Ok(b)) = (jailed.read(&path), real.read(&path)) {
             if a != b {
                 notes.push(format!("WARNING: the specification file {} in the jail was modified; the change is ignored and the file restored", cfg.rel(&f.path)));
             }
-        }
-    }
-    let rels: Vec<String> = specs.iter().map(|f| cfg.rel(&f.path)).collect();
-    for f in djinn_syntax::project::spec_files(jail, cfg.spec_manual.as_deref()) {
-        let rel = f.path.strip_prefix(jail).unwrap_or(&f.path).to_string_lossy().into_owned();
-        if !rels.contains(&rel) {
-            notes.push(format!("WARNING: {rel} in the jail gained a `djinn!` block; the change is ignored"));
         }
     }
     Ok(notes)
@@ -260,45 +264,33 @@ pub fn sync_back(cfg: &Config, jail: &Path) -> Result<Vec<String>, String> {
 
 /// Push the trusted, regenerated files into the jail.
 pub fn sync_forward(cfg: &Config, jail: &Path) -> Result<(), String> {
-    let ld = cfg.lean_dir();
-    let jproofs = proofs_in(cfg, jail);
-    let jd = jproofs.join(&cfg.ns);
-    let unprotect_copy = |src: &Path, dst: &Path| -> Result<(), String> {
-        set_readonly(dst, false);
-        fs::copy(src, dst).map(|_| ()).map_err(|e| format!("{}: {e}", src.display()))?;
-        set_readonly(dst, true);
-        Ok(())
-    };
-    fs::create_dir_all(&jd).map_err(|e| e.to_string())?;
-    for f in ["Spec.lean", "Obligations.lean", "Audit.lean"] {
-        if ld.join(f).exists() {
-            unprotect_copy(&ld.join(f), &jd.join(f))?;
+    let (real, jailed) = roots(cfg, jail)?;
+    let lean = relative(cfg, &cfg.lean_dir())?;
+    for name in ["Spec.lean", "Obligations.lean", "Audit.lean"] {
+        let path = lean.join(name);
+        if real.exists(&path).map_err(|e| e.to_string())? {
+            jailed.copy_file(&real, &path, &path, true).map_err(|e| format!("cannot refresh {}: {e}", path.display()))?;
         }
     }
-    if ld.join("Code").is_dir() {
-        set_readonly_tree(&jd.join("Code"), false);
-        let _ = fs::remove_dir_all(jd.join("Code"));
-        copy_dir(&ld.join("Code"), &jd.join("Code"))?;
-        set_readonly_tree(&jd.join("Code"), true);
+    let code = lean.join("Code");
+    if real.exists(&code).map_err(|e| e.to_string())? {
+        jailed.mirror_tree(&real, &code, true).map_err(|e| e.to_string())?;
     }
-    // the guide and Aeneas's name table live at the jail's root, not in the Lean project
-    if cfg.guide_path().exists() {
-        unprotect_copy(&cfg.guide_path(), &jail.join("GUIDE.md"))?;
+    for (source, dest) in [(cfg.guide_path(), "GUIDE.md"), (cfg.translation_path(), "translation.json")] {
+        let source = relative(cfg, &source)?;
+        if real.exists(&source).map_err(|e| e.to_string())? {
+            jailed.copy_file(&real, &source, Path::new(dest), true).map_err(|e| e.to_string())?;
+        } else {
+            jailed.remove(Path::new(dest)).map_err(|e| e.to_string())?;
+        }
     }
-    if cfg.translation_path().exists() {
-        let _ = fs::copy(cfg.translation_path(), jail.join("translation.json"));
-    } else {
-        let _ = fs::remove_file(jail.join("translation.json"));
+    let build = relative(cfg, &cfg.proofs)?.join(".lake/build");
+    if real.exists(&build).map_err(|e| e.to_string())? {
+        jailed.mirror_tree(&real, &build, false).map_err(|e| e.to_string())?;
     }
-    // the build artifacts of the trusted modules, so that the agent's next
-    // `lake env lean` does not have to recompile Spec/Code/Obligations
-    let bd = cfg.proofs.join(".lake").join("build");
-    if bd.is_dir() {
-        let _ = copy_dir(&bd, &jproofs.join(".lake").join("build"));
-    }
-    // the specification, restored
     for f in cfg.specs() {
-        unprotect_copy(&f.path, &jail.join(cfg.rel(&f.path)))?;
+        let path = relative(cfg, &f.path)?;
+        jailed.copy_file(&real, &path, &path, true).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
