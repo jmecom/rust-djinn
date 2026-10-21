@@ -168,13 +168,37 @@ impl Decl {
         }
         v
     }
-    /// Input names (as seen by the specification) and types: a `&mut`
-    /// parameter `v` is the input `v_old`.
+    /// Input names and types. A `&mut` parameter `v` uses `v_old`, with a
+    /// suffix when necessary to avoid another source or generated identifier.
     pub fn inputs(&self) -> Vec<(String, RType)> {
+        let mut used = self.source_names();
         self.params
             .iter()
-            .map(|p| (if p.mut_ref { format!("{}_old", p.name) } else { p.name.clone() }, p.ty.clone()))
+            .map(|p| {
+                let name = if p.mut_ref { fresh_name(&format!("{}_old", p.name), &mut used) } else { p.name.clone() };
+                (name, p.ty.clone())
+            })
             .collect()
+    }
+    /// Every source identifier, including binders in nested expressions. Generated
+    /// names must avoid these even before the corresponding binder is in scope.
+    pub(crate) fn source_names(&self) -> std::collections::HashSet<String> {
+        fn collect(tokens: TokenStream, out: &mut std::collections::HashSet<String>) {
+            for token in tokens {
+                match token {
+                    proc_macro2::TokenTree::Ident(i) => { out.insert(i.to_string()); }
+                    proc_macro2::TokenTree::Group(g) => collect(g.stream(), out),
+                    _ => {}
+                }
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        if let Ok(tokens) = self.source.parse() {
+            collect(tokens, &mut names);
+        }
+        names.extend(self.params.iter().map(|p| p.name.clone()));
+        names.extend(self.ret.iter().map(|(n, _)| n.clone()));
+        names
     }
     /// Source positions of the top-level body statements.
     pub fn body_spans(&self) -> Vec<Span> {
@@ -235,6 +259,17 @@ impl Decl {
     pub fn inherits_ambiguity(&self, is_weak: impl Fn(&str) -> bool) -> bool {
         self.callees().iter().any(|f| f != &self.name && is_weak(f))
     }
+}
+
+/// Reserve a Lean identifier without capturing any source or generated name.
+pub(crate) fn fresh_name(base: &str, used: &mut std::collections::HashSet<String>) -> String {
+    let mut name = base.to_string();
+    let mut suffix = 1;
+    while !used.insert(name.clone()) {
+        name = format!("{base}_{suffix}");
+        suffix += 1;
+    }
+    name
 }
 
 /// An `any x: T where …;` statement of a declaration (see `Decl::choices`).
@@ -435,15 +470,16 @@ impl Expr {
             ExprKind::Call(g, args) => g == f || args.iter().any(rec),
             ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Char(_) | ExprKind::Str(_) | ExprKind::Var(_) | ExprKind::Old(_) => false,
             ExprKind::Bin(_, l, r) | ExprKind::In(l, r) | ExprKind::Index(l, r) => rec(l) || rec(r),
-            ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Cast(x, _) | ExprKind::InRange(x, _) | ExprKind::InDomain(x, _) | ExprKind::Field(x, _) => rec(x),
+            ExprKind::InRange(x, g) | ExprKind::InDomain(x, g) => g == f || rec(x),
+            ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) => rec(x),
             ExprKind::Ctor(_, a) => a.iter().any(rec),
             ExprKind::Variant { fields, .. } => fields.iter().any(|(_, e)| rec(e)),
             ExprKind::Slice(a, b, c) | ExprKind::IfVal(a, b, c) => rec(a) || rec(b) || rec(c),
             ExprKind::Method(m) => m.children().iter().any(|x| x.calls(f)),
         }
     }
-    /// The names of every function the expression calls (`range(f)` and
-    /// `domain(f)` mention `f` without calling it).
+    /// Every declaration needed to lower the expression, including `range(f)`
+    /// and `domain(f)`, which refer to the generated relation/precondition.
     pub fn callees(&self, out: &mut Vec<String>) {
         let mut rec = |x: &Expr| x.callees(out);
         match &self.kind {
@@ -456,7 +492,11 @@ impl Expr {
                 rec(l);
                 rec(r);
             }
-            ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Cast(x, _) | ExprKind::InRange(x, _) | ExprKind::InDomain(x, _) | ExprKind::Field(x, _) => rec(x),
+            ExprKind::InRange(x, g) | ExprKind::InDomain(x, g) => {
+                out.push(g.clone());
+                x.callees(out);
+            }
+            ExprKind::Not(x) | ExprKind::Neg(x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) => rec(x),
             ExprKind::Ctor(_, a) => a.iter().for_each(|x| x.callees(out)),
             ExprKind::Variant { fields, .. } => fields.iter().for_each(|(_, e)| e.callees(out)),
             ExprKind::Slice(a, b, c) | ExprKind::IfVal(a, b, c) => {

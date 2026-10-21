@@ -6,6 +6,7 @@
 use crate::ast::*;
 use proc_macro2::{Delimiter, Group, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
 use quote::ToTokens;
+use syn::ext::IdentExt;
 use syn::parse::{Parse, ParseStream, Parser};
 use syn::spanned::Spanned;
 
@@ -295,7 +296,14 @@ fn convert_type_noref(ty: &syn::Type) -> Result<(RType, bool)> {
                 "Option" => Ok((RType::Option(Box::new(generic(0)?)), false)),
                 "Result" => Ok((RType::Result(Box::new(generic(0)?), Box::new(generic(1)?)), false)),
                 "String" => Ok((RType::Seq(Box::new(RType::Int { signed: false, bits: 8 }), SeqKind::String), false)),
-                "HashMap" => Ok((RType::Map(Box::new(generic(0)?), Box::new(generic(1)?)), false)),
+                "HashMap" => {
+                    if let syn::PathArguments::AngleBracketed(args) = &seg.arguments {
+                        if args.args.len() != 2 {
+                            return bad("specification `HashMap<K, V>` requires exactly two type arguments and the standard default hasher");
+                        }
+                    }
+                    Ok((RType::Map(Box::new(generic(0)?), Box::new(generic(1)?)), false))
+                }
                 "f16" | "f32" | "f64" | "f128" => bad("floating-point types have no Aeneas model (Aeneas's Lean backend defines no F32/F64), so they cannot be verified; use integers"),
                 "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque" | "BinaryHeap" | "LinkedList" => bad(&format!("`{name}` has no model (of the standard library's collections, only `Vec`, slices, arrays and `HashMap` are modeled); use a `HashMap` or a `Vec`")),
                 "Box" | "Rc" | "Arc" | "RefCell" | "Cell" | "Mutex" => bad(&format!("`{name}` has no place in a specification: it describes values, not ownership; use the value's type")),
@@ -384,19 +392,24 @@ fn parse_one(tts: &[TokenTree], pos: &mut usize, span: Span) -> Result<Stmt> {
     if is_ident(first, "some") {
         let start = *pos + 1;
         let (end, group) = find_brace(tts, start, fspan)?;
-        let head = &tts[start..end];
+        // Let syn consume each complete type before treating a comma as a
+        // binder separator: generic arguments are not token-tree groups.
+        let parser = |input: ParseStream| {
+            input.parse_terminated(
+                |input| {
+                    let name: Ident = input.parse()?;
+                    input.parse::<syn::Token![:]>()?;
+                    let ty: syn::Type = input.parse()?;
+                    Ok((name, ty))
+                },
+                syn::Token![,],
+            )
+        };
+        let parsed = parser.parse2(tts[start..end].iter().cloned().collect())
+            .map_err(|e| Error::new(e.span(), format!("{e}")))?;
         let mut binders = Vec::new();
-        for part in split_at(head, |t| is_punct(t, ',')) {
-            if part.is_empty() {
-                continue;
-            }
-            let colon = part.iter().position(|t| is_punct(t, ':'));
-            let (nm, tyt) = match colon {
-                Some(c) if c == 1 => (part[0].to_string(), &part[c + 1..]),
-                _ => return Err(Error::new(fspan, "expected `some <ident>: <type>, … { … }`")),
-            };
-            let ty: syn::Type = syn::parse2(tyt.iter().cloned().collect()).map_err(|e| Error::new(e.span(), format!("{e}")))?;
-            binders.push((nm, convert_type(&ty)?.0));
+        for (name, ty) in parsed {
+            binders.push((name.to_string(), convert_type(&ty)?.0));
         }
         if binders.is_empty() {
             return Err(Error::new(fspan, "`some` needs at least one binder"));
@@ -642,6 +655,18 @@ pub fn parse_expr_tokens(tokens: TokenStream) -> Result<Expr> {
 /// Rewrite `A in B` and `A not in B` (at comparison precedence) into calls
 /// `__djinn_in(A, B)` / `__djinn_notin(A, B)` so that syn can parse them.
 fn rewrite_in(tokens: TokenStream) -> TokenStream {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    // A closure's parameter list is syntax surrounding its expression, not
+    // the left operand of `in` or the first comparison of a chain. Preserve
+    // it before rewriting the body (including all of its boolean clauses).
+    let start = usize::from(tokens.first().is_some_and(|t| is_ident(t, "move")));
+    if tokens.get(start).is_some_and(|t| is_punct(t, '|')) {
+        if let Some(end) = (start + 1..tokens.len()).find(|&i| is_punct(&tokens[i], '|')) {
+            let mut out: TokenStream = tokens[..=end].iter().cloned().collect();
+            out.extend(rewrite_in(tokens[end + 1..].iter().cloned().collect()));
+            return out;
+        }
+    }
     let tts: Vec<TokenTree> = tokens
         .into_iter()
         .map(|t| match t {
@@ -653,7 +678,7 @@ fn rewrite_in(tokens: TokenStream) -> TokenStream {
             t => t,
         })
         .collect();
-    // split at depth-0 `&&`, `||` and keep the separators
+    // Split at expression boundaries and keep their separators.
     let mut out: Vec<TokenTree> = Vec::new();
     let mut seg: Vec<TokenTree> = Vec::new();
     let mut i = 0;
@@ -665,7 +690,7 @@ fn rewrite_in(tokens: TokenStream) -> TokenStream {
         let is_andor = two
             && matches!(&tts[i], TokenTree::Punct(p) if (p.as_char() == '&' || p.as_char() == '|') && p.spacing() == Spacing::Joint)
             && matches!((&tts[i], &tts[i+1]), (TokenTree::Punct(a), TokenTree::Punct(b)) if a.as_char() == b.as_char());
-        let is_boundary = is_ident(&tts[i], "if") || is_ident(&tts[i], "else") || is_brace(&tts[i]).is_some();
+        let is_boundary = is_ident(&tts[i], "if") || is_ident(&tts[i], "else") || is_brace(&tts[i]).is_some() || is_punct(&tts[i], ',') || is_punct(&tts[i], ';');
         if is_andor {
             flush(&mut seg, &mut out);
             out.push(tts[i].clone());
@@ -1048,8 +1073,24 @@ fn method_hint(name: &str) -> String {
     }
 }
 
+/// Every method token that contributes to a supported chain must have its
+/// declared arity. In particular, receivers such as `filter` and `iter` are
+/// consumed by the chain parser rather than recursively by convert_expr.
+fn check_method_arity(m: &syn::ExprMethodCall) -> Result<()> {
+    let expected = match m.method.to_string().as_str() {
+        "len" | "is_empty" | "first" | "last" | "abs" | "is_some" | "is_none" | "unwrap" | "as_bytes" | "iter" | "sum" | "count" => 0,
+        "contains" | "min" | "max" | "pow" | "get" | "contains_key" | "all" | "any" | "filter" | "windows" => 1,
+        _ => return Ok(()),
+    };
+    if m.args.len() != expected {
+        return Err(Error::new(m.method.span(), format!("`.{}(..)` expects {expected} argument(s), found {}", m.method, m.args.len())));
+    }
+    Ok(())
+}
+
 fn convert_method(m: &syn::ExprMethodCall) -> Result<Expr> {
     use syn::Expr as S;
+    check_method_arity(m)?;
     let span = m.span();
     let name = m.method.to_string();
     let err = |msg: String| Err(Error::new(m.method.span(), msg));
@@ -1068,8 +1109,9 @@ fn convert_method(m: &syn::ExprMethodCall) -> Result<Expr> {
     };
     // `.iter()` chains
     if let S::MethodCall(inner) = &*m.receiver {
+        check_method_arity(inner)?;
         let iname = inner.method.to_string();
-        if iname == "iter" && inner.args.is_empty() {
+        if iname == "iter" {
             let seq = convert_expr(&inner.receiver)?;
             return match name.as_str() {
                 "all" => {
@@ -1086,7 +1128,8 @@ fn convert_method(m: &syn::ExprMethodCall) -> Result<Expr> {
         }
         if iname == "filter" && name == "count" {
             if let S::MethodCall(it) = &*inner.receiver {
-                if it.method == "iter" && it.args.is_empty() {
+                if it.method == "iter" {
+                    check_method_arity(it)?;
                     let seq = convert_expr(&it.receiver)?;
                     let (var, pred) = match inner.args.iter().next() {
                         Some(S::Closure(c)) => (closure_param(c)?, convert_expr(&c.body)?),
@@ -1141,17 +1184,99 @@ fn ambient_type_ok(t: &RType) -> bool {
     }
 }
 
+/// The source parser does not run rustc's configuration expansion. Accepting
+/// these attributes would let disabled items or fields change the contract.
+/// Reject both forms, since cfg_attr can introduce cfg (or another expansion).
+fn reject_conditional(attrs: &[syn::Attribute]) -> Result<()> {
+    for attr in attrs {
+        if attr.path().get_ident().is_some_and(|name| matches!(name.unraw().to_string().as_str(), "cfg" | "cfg_attr")) {
+            return Err(Error::new(attr.span(), "conditional definitions (`#[cfg]` / `#[cfg_attr]`) are not supported in specification files; move the selected definition into an unconditional specification file"));
+        }
+    }
+    Ok(())
+}
+
+/// An attribute macro can replace a literal constant or change a type's
+/// fields after this source parser has read them. The builtin derive merely
+/// appends items; reject_ambiguous_derives and project dependency validation
+/// prevent another attribute macro from shadowing it.
+fn reject_transforming_attrs(attrs: &[syn::Attribute], allow_derive: bool) -> Result<()> {
+    for attr in attrs {
+        let path = attr.path();
+        let known_builtin = path.get_ident().is_some_and(|name| matches!(name.unraw().to_string().as_str(),
+            "doc" | "allow" | "warn" | "deny" | "forbid" | "expect" | "repr" | "must_use" | "deprecated" | "non_exhaustive"
+        ));
+        let builtin_derive = allow_derive && path.get_ident().is_some_and(|name| name.unraw() == "derive");
+        // Even a familiar tool path can resolve to a procedural attribute
+        // from an imported crate, so spelling alone is not a sound allowlist.
+        if !known_builtin && !builtin_derive {
+            return Err(Error::new(attr.span(), format!("attribute `{}` may transform this definition before Rust compiles it; specification constants and types support only builtin attributes", path.to_token_stream())));
+        }
+    }
+    Ok(())
+}
+
+fn reject_ambiguous_derives(file: &syn::File) -> Result<()> {
+    fn is_derive(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| attr.path().get_ident().is_some_and(|name| name.unraw() == "derive"))
+    }
+    let has_derive = file.items.iter().any(|item| match item {
+        syn::Item::Struct(s) => is_derive(&s.attrs),
+        syn::Item::Enum(e) => is_derive(&e.attrs),
+        _ => false,
+    });
+    if !has_derive {
+        return Ok(());
+    }
+    fn imports_derive(tree: &syn::UseTree) -> bool {
+        match tree {
+            syn::UseTree::Path(path) => imports_derive(&path.tree),
+            syn::UseTree::Name(name) => name.ident.unraw() == "derive",
+            syn::UseTree::Rename(rename) => rename.rename.unraw() == "derive",
+            syn::UseTree::Glob(_) => true,
+            syn::UseTree::Group(group) => group.items.iter().any(imports_derive),
+        }
+    }
+    for item in &file.items {
+        if let syn::Item::Use(item) = item {
+            if imports_derive(&item.tree) {
+                return Err(Error::new(item.span(), "specification types using builtin `derive` cannot share a file with glob imports or imports named `derive`, which may shadow that attribute"));
+            }
+        }
+        let attrs = match item {
+            syn::Item::ExternCrate(item) => &item.attrs,
+            syn::Item::Mod(item) => &item.attrs,
+            syn::Item::Macro(item) => &item.attrs,
+            _ => continue,
+        };
+        for attr in attrs {
+            if attr.path().get_ident().is_some_and(|name| name.unraw() == "macro_use") {
+                return Err(Error::new(attr.span(), "specification types using builtin `derive` cannot share a file with `macro_use`, which may shadow that attribute"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `struct`, `enum`, literal `const` and `fn` items of a specification file.
 pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
+    reject_conditional(&file.attrs)?;
+    reject_ambiguous_derives(file)?;
     let mut t = TypeDefs::default();
     for item in &file.items {
         match item {
             syn::Item::Enum(e) => {
+                reject_conditional(&e.attrs)?;
+                reject_transforming_attrs(&e.attrs, true)?;
                 if !e.generics.params.is_empty() {
                     return Err(Error::new(e.ident.span(), "generic enums are not supported in specifications"));
                 }
                 let mut variants = Vec::new();
                 for v in &e.variants {
+                    reject_conditional(&v.attrs)?;
+                    for field in &v.fields {
+                        reject_conditional(&field.attrs)?;
+                    }
                     let fields = match &v.fields {
                         syn::Fields::Unit => vec![],
                         syn::Fields::Unnamed(u) => u.unnamed.iter().map(|f| convert_type(&f.ty).map(|(t, _)| (None, t))).collect::<Result<Vec<_>>>()?,
@@ -1162,6 +1287,11 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 t.enums.insert(e.ident.to_string(), EnumDef { name: e.ident.to_string(), variants });
             }
             syn::Item::Struct(s) => {
+                reject_conditional(&s.attrs)?;
+                reject_transforming_attrs(&s.attrs, true)?;
+                for field in &s.fields {
+                    reject_conditional(&field.attrs)?;
+                }
                 if !s.generics.params.is_empty() {
                     return Err(Error::new(s.ident.span(), "generic structs are not supported in specifications"));
                 }
@@ -1172,6 +1302,13 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 t.structs.insert(s.ident.to_string(), StructDef { name: s.ident.to_string(), fields });
             }
             syn::Item::Fn(f) => {
+                reject_conditional(&f.attrs)?;
+                for arg in &f.sig.inputs {
+                    match arg {
+                        syn::FnArg::Typed(p) => reject_conditional(&p.attrs)?,
+                        syn::FnArg::Receiver(r) => reject_conditional(&r.attrs)?,
+                    }
+                }
                 let name = f.sig.ident.to_string();
                 let span = f.sig.ident.span();
                 let source = crate::project::canonical(&f.to_token_stream());
@@ -1227,6 +1364,8 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 }
             }
             syn::Item::Const(c) => {
+                reject_conditional(&c.attrs)?;
+                reject_transforming_attrs(&c.attrs, false)?;
                 // only literal constants (optionally negated) are usable in specifications
                 let value = match convert_expr(&c.expr) {
                     Ok(v) if matches!(v.kind, ExprKind::Int(_) | ExprKind::Bool(_) | ExprKind::Char(_) | ExprKind::Str(_)) || matches!(&v.kind, ExprKind::Neg(x) if matches!(x.kind, ExprKind::Int(_))) => v,
@@ -1234,6 +1373,9 @@ pub fn collect_types(file: &syn::File) -> Result<TypeDefs> {
                 };
                 let (ty, _) = convert_type(&c.ty)?;
                 t.consts.insert(c.ident.to_string(), Const { name: c.ident.to_string(), ty, value });
+            }
+            syn::Item::Macro(m) if m.mac.path.segments.last().is_some_and(|s| matches!(s.ident.to_string().as_str(), "djinn" | "func" | "rel")) => {
+                reject_conditional(&m.attrs)?;
             }
             _ => {}
         }

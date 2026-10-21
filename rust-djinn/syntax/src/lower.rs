@@ -2,7 +2,7 @@
 
 use crate::ast::*;
 use crate::types::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// What the lowering of other declarations needs to know about a callee.
 #[derive(Clone, Debug)]
@@ -56,6 +56,8 @@ pub(crate) enum Cx {
     Forall(String, String),
     ForallRange(String, String, String),
     Guard(String),
+    /// One obligation for every adjacent pair in a `windows(2)` predicate.
+    ForallWindow(String, String, String),
     /// `match scrut with | pat => P | _ => True`
     /// scrutinee, this arm's pattern, the patterns of the arms before it,
     /// and the number of variants of the enum (a wildcard arm is emitted only
@@ -72,11 +74,12 @@ pub(crate) struct L<'a> {
     pub(crate) env: HashMap<String, (String, SType)>,
     /// `v` → `v_old` while lowering `requires`.
     pub(crate) pre_scope: bool,
-    pub(crate) muts: Vec<String>,
+    pub(crate) old_names: HashMap<String, String>,
     pub(crate) cx: Vec<Cx>,
     pub(crate) guards: Vec<String>,
     pub(crate) wf: Vec<String>,
     pub(crate) fresh: usize,
+    pub(crate) used_names: HashSet<String>,
     /// The declaration being lowered, when it is recursive: conjunctions
     /// whose right side calls it are emitted as `A ∧ (A → B)` so that Lean's
     /// termination checker sees `A`.
@@ -141,18 +144,21 @@ pub fn lower_with(d: &Decl, decls: &HashMap<String, DeclInfo>, types: &TypeDefs,
     for (n, t) in d.inputs() {
         env.insert(n.clone(), (n, SType::Of(t)));
     }
-    let muts: Vec<String> = d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect();
+    let old_names = d.params.iter().zip(d.inputs()).filter(|(p, _)| p.mut_ref).map(|(p, (n, _))| (p.name.clone(), n)).collect();
+    let mut used_names = d.source_names();
+    used_names.extend(d.inputs().into_iter().map(|(n, _)| n));
     let mut l = L {
         decls,
         types,
         names,
         env,
         pre_scope: true,
-        muts,
+        old_names,
         cx: vec![],
         guards: vec![],
         wf: vec![],
         fresh: 0,
+        used_names,
         recursive: if d.is_recursive() { Some(d.name.clone()) } else { None },
         has_choices: own || (d.kind == Kind::Func && inherits),
         input_names: d.inputs().into_iter().map(|(n, _)| n).collect(),
@@ -303,6 +309,26 @@ impl Callee {
 }
 
 impl<'a> L<'a> {
+    fn fresh_name(&mut self, prefix: &str) -> String {
+        let base = format!("{prefix}{}", self.fresh);
+        self.fresh += 1;
+        fresh_name(&base, &mut self.used_names)
+    }
+
+    /// Evaluate a closure only for elements that the iterator actually visits.
+    /// Flush inside the binder so short-circuit and partial-operation guards
+    /// cannot escape with an unbound closure parameter.
+    fn with_element<T>(&mut self, seq: &str, var: &str, ty: SType, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.flush_guards();
+        self.cx.push(Cx::Forall(var.to_string(), stype_lean(&ty, self.names)));
+        self.cx.push(Cx::Guard(format!("{var} ∈ {seq}")));
+        let result = self.with_vars(&[(var.to_string(), ty)], f);
+        self.flush_guards();
+        self.cx.pop();
+        self.cx.pop();
+        result
+    }
+
     /// The callee named `f`, if a constraint may call it.
     pub(crate) fn callee(&self, f: &str) -> Option<Callee> {
         if let Some(i) = self.decls.get(f) {
@@ -322,7 +348,8 @@ impl<'a> L<'a> {
             p = match c {
                 Cx::Forall(x, t) => format!("∀ {x} : {t}, {p}"),
                 Cx::ForallRange(i, lo, hi) => format!("∀ {i} : ℤ, {lo} ≤ {i} → {i} < {hi} → {p}"),
-                Cx::Guard(g) => format!("{g} → {p}"),
+                Cx::Guard(g) => format!("({g}) → {p}"),
+                Cx::ForallWindow(a, b, seq) => format!("List.Chain' (fun {a} {b} => {p}) {seq}"),
                 Cx::MatchArm(s, pat, prev, nvariants) => {
                     // the item holds in this arm only: the earlier arms are
                     // vacuous, and so is the rest unless this arm is the `_`
@@ -421,15 +448,17 @@ impl<'a> L<'a> {
     /// A fresh choice: a function of the inputs and of the binders in scope
     /// into `ty` (a Lean type), named after `name`; returns its Lean name
     /// and the term it stands for here (the function applied).
-    fn new_choice(&mut self, name: &str, ty: &str) -> (String, String) {
+    fn new_choice(&mut self, name: &str, ty: &str, source_name: bool) -> (String, String) {
         // distinct Lean names for choices of the same source name in
         // sibling blocks, or lifted from several calls of the same callee
-        let mut lean = name.to_string();
-        let mut k = 1;
-        while self.choices.iter().any(|(n, _)| n == &lean) || self.input_names.contains(&lean) {
-            lean = format!("{name}_{k}");
-            k += 1;
-        }
+        let lean = if !source_name || self.choices.iter().any(|(n, _)| n == name)
+            || self.env.contains_key(name) || self.input_names.iter().any(|n| n == name)
+        {
+            fresh_name(name, &mut self.used_names)
+        } else {
+            self.used_names.insert(name.to_string());
+            name.to_string()
+        };
         let paren = |t: &str| if t.contains(' ') { format!("({t})") } else { t.to_string() };
         let mut fun_ty: Vec<String> = self.input_tys.iter().map(|t| paren(t)).collect();
         fun_ty.extend(self.binders.iter().map(|(_, t)| paren(t)));
@@ -443,7 +472,7 @@ impl<'a> L<'a> {
     /// `any x: T where c;` — `x` is a fresh choice function applied to the
     /// inputs and binders; only `c` remains to be stated.
     fn any_stmt(&mut self, name: &str, ty: &RType, wherec: &Expr) -> Result<String> {
-        let (_, term) = self.new_choice(name, &view_type(ty, self.names));
+        let (_, term) = self.new_choice(name, &view_type(ty, self.names), true);
         self.env.insert(name.to_string(), (term, SType::Of(ty.clone())));
         self.any_scope.push(name.to_string());
         self.constraint(wherec)
@@ -462,9 +491,12 @@ impl<'a> L<'a> {
                 self.flush_guards();
                 let et = stype_lean(&elem, self.names);
                 self.cx.push(Cx::Forall(var.clone(), et.clone()));
+                self.cx.push(Cx::Guard(format!("{var} ∈ {st}")));
                 self.binders.push((var.clone(), et));
                 let b = self.with_vars(&[(var.clone(), elem)], |l| l.stmts(body))?;
+                self.flush_guards();
                 self.binders.pop();
+                self.cx.pop();
                 self.cx.pop();
                 Ok(format!("(∀ {var}, {var} ∈ {st} → {b})"))
             }
@@ -487,11 +519,15 @@ impl<'a> L<'a> {
                 // discarding the items, then once more under the guard.
                 let saved = self.wf.len();
                 let saved_choices = self.choices.len();
+                let saved_names = self.used_names.clone();
+                let saved_fresh = self.fresh;
                 let guard = self.with_vars(&binds, |l| l.stmts(body))?;
                 self.wf.truncate(saved);
                 // choices lifted at call sites inside: made again, under the
                 // binders, by the second lowering
                 self.choices.truncate(saved_choices);
+                self.used_names = saved_names;
+                self.fresh = saved_fresh;
                 self.guards.clear();
                 for (n, t) in &binds {
                     self.cx.push(Cx::Forall(n.clone(), stype_lean(t, self.names)));
@@ -611,7 +647,7 @@ impl<'a> L<'a> {
                         match binder {
                             None => lean_binders.push("_".to_string()),
                             Some(b) => {
-                                let lean = format!("{b}_{k}");
+                                let lean = fresh_name(&format!("{b}_{k}"), &mut self.used_names);
                                 lean_binders.push(lean.clone());
                                 binds.push((b.clone(), view_term(&lean, fty), SType::Of(fty.clone())));
                             }
@@ -644,28 +680,6 @@ impl<'a> L<'a> {
     }
 
     pub(crate) fn constraint_inner(&mut self, e: &Expr) -> Result<String> {
-        // f(args) == e  /  e == f(args)
-        if let ExprKind::Bin(BinOp::Eq, l, r) = &e.kind {
-            if let ExprKind::Call(f, args) = &l.kind {
-                if self.callee(f).is_some() {
-                    return self.call_eq(f, args, r, e.span);
-                }
-            }
-            if let ExprKind::Call(f, args) = &r.kind {
-                if self.callee(f).is_some() {
-                    return self.call_eq(f, args, l, e.span);
-                }
-            }
-        }
-        // call in prop position with a bool output: f(args) == true
-        if let ExprKind::Call(f, args) = &e.kind {
-            if let Some(info) = self.callee(f) {
-                if info.outputs().len() == 1 && info.outputs()[0] == RType::Bool {
-                    let t = Expr::new(e.span, ExprKind::Bool(true));
-                    return self.call_eq(f, args, &t, e.span);
-                }
-            }
-        }
         // `b == (P)` / `b != (P)` for a boolean `b`: `(b = true ↔ P)`, with `P`
         // read as a constraint (short-circuit scoping, local lifting)
         if let ExprKind::Bin(op @ (BinOp::Eq | BinOp::Ne), l, r) = &e.kind {
@@ -722,6 +736,44 @@ impl<'a> L<'a> {
             } else {
                 format!("({lp} ∨ {rp})")
             });
+        }
+        // A value-level conditional is local to this logical operand. Split the
+        // surrounding constraint before lifting calls, so neither a branch's
+        // witness nor its partial-operation requirements can become unconditional.
+        if let Some((cond, then_expr, else_expr)) = split_if_value(e) {
+            let cp = self.constraint_inner(&cond)?;
+            self.flush_guards();
+            self.cx.push(Cx::Guard(cp.clone()));
+            let tp = self.constraint_inner(&then_expr)?;
+            self.flush_guards();
+            self.cx.pop();
+            self.cx.push(Cx::Guard(format!("¬({cp})")));
+            let ep = self.constraint_inner(&else_expr)?;
+            self.flush_guards();
+            self.cx.pop();
+            return Ok(format!("(({cp} → {tp}) ∧ (¬({cp}) → {ep}))"));
+        }
+        // f(args) == e  /  e == f(args)
+        if let ExprKind::Bin(BinOp::Eq, l, r) = &e.kind {
+            if let ExprKind::Call(f, args) = &l.kind {
+                if self.callee(f).is_some() {
+                    return self.call_eq(f, args, r, e.span);
+                }
+            }
+            if let ExprKind::Call(f, args) = &r.kind {
+                if self.callee(f).is_some() {
+                    return self.call_eq(f, args, l, e.span);
+                }
+            }
+        }
+        // call in prop position with a bool output: f(args) == true
+        if let ExprKind::Call(f, args) = &e.kind {
+            if let Some(info) = self.callee(f) {
+                if info.outputs().len() == 1 && info.outputs()[0] == RType::Bool {
+                    let t = Expr::new(e.span, ExprKind::Bool(true));
+                    return self.call_eq(f, args, &t, e.span);
+                }
+            }
         }
         // nested calls: implicit existentials
         let mut lifted = Vec::new();
@@ -781,8 +833,7 @@ impl<'a> L<'a> {
             }
             // the output is of another type (a machine integer against a
             // mathematical one, say): name it and compare through the views
-            let v = format!("v_out{}", l.fresh);
-            l.fresh += 1;
+            let v = l.fresh_name("v_out");
             let eq = Expr::new(span, ExprKind::Bin(BinOp::Eq, Box::new(Expr::new(span, ExprKind::Var(v.clone()))), Box::new(nout.clone())));
             let (call, cmp) = l.with_vars(&[(v.clone(), SType::Of(out_ty.clone()))], |l| Ok((l.spec_app(&f, &nargs, &v, span)?, l.prop(&eq)?)))?;
             Ok(format!("(∃ {v} : {}, {call} ∧ {cmp})", view_type(&out_ty, l.names)))
@@ -822,7 +873,7 @@ impl<'a> L<'a> {
                     }
                     let mut lifted = Vec::new();
                     for (cn, ct) in info.choices.clone() {
-                        let (_, term) = self.new_choice(&format!("{f}_{cn}"), &ct);
+                        let (_, term) = self.new_choice(&format!("{f}_{cn}"), &ct, false);
                         lifted.push(term);
                     }
                     return Ok(format!("{f}_body {} {} {}", as_.join(" "), lifted.join(" "), out));
@@ -857,8 +908,7 @@ impl<'a> L<'a> {
                 for a in args {
                     nargs.push(self.lift_calls(a, out)?);
                 }
-                let v = format!("v_call{}", self.fresh);
-                self.fresh += 1;
+                let v = self.fresh_name("v_call");
                 out.push((v.clone(), f.clone(), nargs, info.outputs()[0].clone()));
                 mk(ExprKind::Var(v))
             }
@@ -907,7 +957,10 @@ impl<'a> L<'a> {
                     Method::AsBytes(x) => Method::AsBytes(*rec!(x)),
                     Method::MapGet(a, b) => Method::MapGet(*rec!(a), *rec!(b)),
                     Method::ContainsKey(a, b) => Method::ContainsKey(*rec!(a), *rec!(b)),
-                    other => other.clone(),
+                    Method::Count { seq, var, pred } => Method::Count { seq: *rec!(seq), var: var.clone(), pred: pred.clone() },
+                    Method::All { seq, var, pred } => Method::All { seq: *rec!(seq), var: var.clone(), pred: pred.clone() },
+                    Method::Any { seq, var, pred } => Method::Any { seq: *rec!(seq), var: var.clone(), pred: pred.clone() },
+                    Method::Windows2All { seq, var, pred } => Method::Windows2All { seq: *rec!(seq), var: var.clone(), pred: pred.clone() },
                 };
                 mk(ExprKind::Method(Box::new(m2)))
             }
@@ -980,10 +1033,14 @@ impl<'a> L<'a> {
                 if info.outputs.len() != 1 {
                     return err(format!("`range({f})`: `{f}` must have exactly one output"));
                 }
-                let (xt, _) = self.term(x)?;
-                let bs: Vec<String> = info.inputs.iter().enumerate().map(|(i, t)| format!("(a{i} : {})", view_type(t, self.names))).collect();
-                let as_: Vec<String> = (0..info.inputs.len()).map(|i| format!("a{i}")).collect();
-                format!("(∃ {}, {f}_spec {} {xt})", bs.join(" "), as_.join(" "))
+                let xt = self.term_as(x, &info.outputs[0])?;
+                let as_: Vec<String> = (0..info.inputs.len()).map(|i| fresh_name(&format!("a{i}"), &mut self.used_names)).collect();
+                let bs: Vec<String> = as_.iter().zip(&info.inputs).map(|(a, t)| format!("({a} : {})", view_type(t, self.names))).collect();
+                if bs.is_empty() {
+                    format!("{f}_spec {xt}")
+                } else {
+                    format!("(∃ {}, {f}_spec {} {xt})", bs.join(" "), as_.join(" "))
+                }
             }
             ExprKind::InDomain(x, f) => {
                 let info = match self.decls.get(f) {
@@ -998,9 +1055,13 @@ impl<'a> L<'a> {
                 if info.total {
                     pre
                 } else {
-                    let os: Vec<String> = info.outputs.iter().enumerate().map(|(i, t)| format!("(o{i} : {})", view_type(t, self.names))).collect();
-                    let on: Vec<String> = (0..info.outputs.len()).map(|i| format!("o{i}")).collect();
-                    format!("({pre} ∧ ∃ {}, {f}_spec {xt} {})", os.join(" "), on.join(" "))
+                    let on: Vec<String> = (0..info.outputs.len()).map(|i| fresh_name(&format!("o{i}"), &mut self.used_names)).collect();
+                    let os: Vec<String> = on.iter().zip(&info.outputs).map(|(o, t)| format!("({o} : {})", view_type(t, self.names))).collect();
+                    if os.is_empty() {
+                        format!("({pre} ∧ {f}_spec {xt})")
+                    } else {
+                        format!("({pre} ∧ ∃ {}, {f}_spec {xt} {})", os.join(" "), on.join(" "))
+                    }
                 }
             }
             ExprKind::Method(m) => match &**m {
@@ -1022,20 +1083,24 @@ impl<'a> L<'a> {
                 }
                 Method::All { seq, var, pred } => {
                     let (st, et) = self.seq(seq)?;
-                    let p = self.with_vars(&[(var.clone(), et)], |l| l.prop(pred))?;
+                    let p = self.with_element(&st, var, et, |l| l.constraint_inner(pred))?;
                     format!("(∀ {var}, {var} ∈ {st} → {p})")
                 }
                 Method::Any { seq, var, pred } => {
                     let (st, et) = self.seq(seq)?;
-                    let p = self.with_vars(&[(var.clone(), et)], |l| l.prop(pred))?;
+                    let p = self.with_element(&st, var, et, |l| l.constraint_inner(pred))?;
                     format!("(∃ {var}, {var} ∈ {st} ∧ {p})")
                 }
                 Method::Windows2All { seq, var, pred } => {
                     let (st, et) = self.seq(seq)?;
-                    let a = format!("{var}0");
-                    let b = format!("{var}1");
+                    self.flush_guards();
+                    let a = fresh_name(&format!("{var}0"), &mut self.used_names);
+                    let b = fresh_name(&format!("{var}1"), &mut self.used_names);
                     let pred2 = subst_window(pred, var, &a, &b);
-                    let p = self.with_vars(&[(a.clone(), et.clone()), (b.clone(), et)], |l| l.prop(&pred2))?;
+                    self.cx.push(Cx::ForallWindow(a.clone(), b.clone(), st.clone()));
+                    let p = self.with_vars(&[(a.clone(), et.clone()), (b.clone(), et)], |l| l.constraint_inner(&pred2))?;
+                    self.flush_guards();
+                    self.cx.pop();
                     format!("List.Chain' (fun {a} {b} => {p}) {st}")
                 }
                 Method::IsSome(o) => format!("{}.isSome = true", self.term(o)?.0),
@@ -1150,8 +1215,8 @@ impl<'a> L<'a> {
             ExprKind::Char(c) => (char_lit(*c), SType::Of(RType::Char)),
             ExprKind::Str(b) => (bytes_lit(b), SType::Of(RType::Seq(Box::new(RType::Int { signed: false, bits: 8 }), SeqKind::Str))),
             ExprKind::Var(v) => {
-                let name = if self.pre_scope && self.muts.contains(v) { format!("{v}_old") } else { v.clone() };
-                match self.env.get(&name) {
+                let name = if self.pre_scope { self.old_names.get(v).unwrap_or(v) } else { v };
+                match self.env.get(name) {
                     Some((t, ty)) => (t.clone(), ty.clone()),
                     None => {
                         if v.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
@@ -1162,8 +1227,8 @@ impl<'a> L<'a> {
                 }
             }
             ExprKind::Old(v) => {
-                let name = format!("{v}_old");
-                match self.env.get(&name) {
+                let name = self.old_names.get(v).ok_or_else(|| Error::new(span, format!("`old({v})`: not a `&mut` parameter")))?;
+                match self.env.get(name) {
                     Some((t, ty)) => (t.clone(), ty.clone()),
                     None => return err(format!("`old({v})`: not a `&mut` parameter")),
                 }
@@ -1293,16 +1358,23 @@ impl<'a> L<'a> {
                 let is_lit = |x: &str| x.chars().all(|c| c.is_ascii_digit());
                 let drop = if is_lit(&a) { a.clone() } else { format!("({a}).toNat") };
                 let take = match (is_lit(&a), is_lit(&b)) {
-                    (true, true) => (b.parse::<i64>().unwrap_or(0) - a.parse::<i64>().unwrap_or(0)).max(0).to_string(),
+                    (true, true) => format!("({b} - {a})"),
                     (true, false) if a == "0" => format!("({b}).toNat"),
                     _ => format!("({b} - {a}).toNat"),
                 };
                 (format!("(({st}.drop {drop}).take {take})"), SType::Of(RType::Seq(Box::new(elem), SeqKind::Slice)))
             }
             ExprKind::IfVal(c, a, b) => {
-                let cp = self.prop(c)?;
+                let cp = self.constraint_inner(c)?;
+                self.flush_guards();
+                self.cx.push(Cx::Guard(cp.clone()));
                 let (at, aty) = self.term(a)?;
+                self.flush_guards();
+                self.cx.pop();
+                self.cx.push(Cx::Guard(format!("¬({cp})")));
                 let (bt, bty) = self.term(b)?;
+                self.flush_guards();
+                self.cx.pop();
                 if aty == bty {
                     (format!("(if {cp} then {at} else {bt})"), aty)
                 } else {
@@ -1325,10 +1397,13 @@ impl<'a> L<'a> {
                 Method::Count { seq, var, pred } => {
                     let (st, et) = self.seq(seq)?;
                     if let Some(x) = count_target(pred, var) {
-                        let (xt, _) = self.term(&x)?;
+                        let xt = self.with_element(&st, var, et.clone(), |l| match &et {
+                            SType::Of(t) => l.term_as(&x, t),
+                            _ => Ok(l.term(&x)?.0),
+                        })?;
                         (format!("(List.count {xt} {st} : ℤ)"), SType::Int)
                     } else {
-                        let p = self.with_vars(&[(var.clone(), et)], |l| l.prop(pred))?;
+                        let p = self.with_element(&st, var, et, |l| l.constraint_inner(pred))?;
                         (format!("({st}.countP (fun {var} => decide ({p})) : ℤ)"), SType::Int)
                     }
                 }
@@ -1462,20 +1537,96 @@ fn mentions(e: &Expr, var: &str) -> bool {
     }
 }
 
-fn subst_window(e: &Expr, w: &str, a: &str, b: &str) -> Expr {
-    let s = |x: &Expr| subst_window(x, w, a, b);
-    let span = e.span;
-    let k = match &e.kind {
-        ExprKind::Index(seq, i) if matches!(&seq.kind, ExprKind::Var(v) if v == w) => match &i.kind {
-            ExprKind::Int(n) if n == "0" => ExprKind::Var(a.into()),
-            ExprKind::Int(n) if n == "1" => ExprKind::Var(b.into()),
-            _ => return e.clone(),
+/// Rebuild an expression by mapping its immediate children. Predicate binders
+/// are traversed only when the caller explicitly requests it.
+fn map_children(e: &Expr, under_binders: bool, mut f: impl FnMut(&Expr) -> Expr) -> Expr {
+    let bx = |x: &Expr, f: &mut dyn FnMut(&Expr) -> Expr| Box::new(f(x));
+    let kind = match &e.kind {
+        ExprKind::Bin(op, a, b) => ExprKind::Bin(*op, bx(a, &mut f), bx(b, &mut f)),
+        ExprKind::Not(a) => ExprKind::Not(bx(a, &mut f)),
+        ExprKind::Neg(a) => ExprKind::Neg(bx(a, &mut f)),
+        ExprKind::Cast(a, t) => ExprKind::Cast(bx(a, &mut f), t.clone()),
+        ExprKind::Field(a, n) => ExprKind::Field(bx(a, &mut f), n.clone()),
+        ExprKind::Call(n, args) => ExprKind::Call(n.clone(), args.iter().map(&mut f).collect()),
+        ExprKind::Ctor(n, args) => ExprKind::Ctor(n.clone(), args.iter().map(&mut f).collect()),
+        ExprKind::Variant { enum_name, variant, fields } => ExprKind::Variant {
+            enum_name: enum_name.clone(), variant: variant.clone(),
+            fields: fields.iter().map(|(n, x)| (n.clone(), f(x))).collect(),
         },
-        ExprKind::Bin(op, l, r) => ExprKind::Bin(*op, Box::new(s(l)), Box::new(s(r))),
-        ExprKind::Not(x) => ExprKind::Not(Box::new(s(x))),
-        ExprKind::Neg(x) => ExprKind::Neg(Box::new(s(x))),
-        ExprKind::IfVal(c, x, y) => ExprKind::IfVal(Box::new(s(c)), Box::new(s(x)), Box::new(s(y))),
+        ExprKind::In(a, b) => ExprKind::In(bx(a, &mut f), bx(b, &mut f)),
+        ExprKind::InRange(a, n) => ExprKind::InRange(bx(a, &mut f), n.clone()),
+        ExprKind::InDomain(a, n) => ExprKind::InDomain(bx(a, &mut f), n.clone()),
+        ExprKind::Index(a, b) => ExprKind::Index(bx(a, &mut f), bx(b, &mut f)),
+        ExprKind::Slice(a, b, c) => ExprKind::Slice(bx(a, &mut f), bx(b, &mut f), bx(c, &mut f)),
+        ExprKind::IfVal(a, b, c) => ExprKind::IfVal(bx(a, &mut f), bx(b, &mut f), bx(c, &mut f)),
+        ExprKind::Method(m) => ExprKind::Method(Box::new(match &**m {
+            Method::Len(a) => Method::Len(f(a)),
+            Method::IsEmpty(a) => Method::IsEmpty(f(a)),
+            Method::Contains(a, b) => Method::Contains(f(a), f(b)),
+            Method::Sum(a) => Method::Sum(f(a)),
+            Method::First(a) => Method::First(f(a)),
+            Method::Last(a) => Method::Last(f(a)),
+            Method::Abs(a) => Method::Abs(f(a)),
+            Method::Min(a, b) => Method::Min(f(a), f(b)),
+            Method::Max(a, b) => Method::Max(f(a), f(b)),
+            Method::Pow(a, b) => Method::Pow(f(a), f(b)),
+            Method::IsSome(a) => Method::IsSome(f(a)),
+            Method::IsNone(a) => Method::IsNone(f(a)),
+            Method::Unwrap(a) => Method::Unwrap(f(a)),
+            Method::AsBytes(a) => Method::AsBytes(f(a)),
+            Method::MapGet(a, b) => Method::MapGet(f(a), f(b)),
+            Method::ContainsKey(a, b) => Method::ContainsKey(f(a), f(b)),
+            Method::Count { seq, var, pred } => Method::Count { seq: f(seq), var: var.clone(), pred: if under_binders { f(pred) } else { pred.clone() } },
+            Method::All { seq, var, pred } => Method::All { seq: f(seq), var: var.clone(), pred: if under_binders { f(pred) } else { pred.clone() } },
+            Method::Any { seq, var, pred } => Method::Any { seq: f(seq), var: var.clone(), pred: if under_binders { f(pred) } else { pred.clone() } },
+            Method::Windows2All { seq, var, pred } => Method::Windows2All { seq: f(seq), var: var.clone(), pred: if under_binders { f(pred) } else { pred.clone() } },
+        })),
         _ => return e.clone(),
     };
-    Expr::new(span, k)
+    Expr::new(e.span, kind)
+}
+
+/// The first conditional outside predicate binders, together with the enclosing
+/// expression with that occurrence replaced by each alternative.
+fn split_if_value(e: &Expr) -> Option<(Expr, Expr, Expr)> {
+    if let ExprKind::IfVal(c, a, b) = &e.kind {
+        return Some(((**c).clone(), (**a).clone(), (**b).clone()));
+    }
+    let mut found = None;
+    let mut child_index = 0;
+    let then_expr = map_children(e, false, |child| {
+        let index = child_index;
+        child_index += 1;
+        if found.is_none() {
+            if let Some((cond, then_child, else_child)) = split_if_value(child) {
+                found = Some((index, cond, else_child));
+                return then_child;
+            }
+        }
+        child.clone()
+    });
+    let (target, cond, else_child) = found?;
+    let mut child_index = 0;
+    let else_expr = map_children(e, false, |child| {
+        let index = child_index;
+        child_index += 1;
+        if index == target { else_child.clone() } else { child.clone() }
+    });
+    Some((cond, then_expr, else_expr))
+}
+
+fn subst_window(e: &Expr, w: &str, a: &str, b: &str) -> Expr {
+    if let ExprKind::Index(seq, i) = &e.kind {
+        if matches!(&seq.kind, ExprKind::Var(v) if v == w) {
+            let replacement = match &i.kind {
+                ExprKind::Int(n) if n == "0" => Some(a),
+                ExprKind::Int(n) if n == "1" => Some(b),
+                _ => None,
+            };
+            if let Some(name) = replacement {
+                return Expr::new(e.span, ExprKind::Var(name.to_string()));
+            }
+        }
+    }
+    map_children(e, true, |x| subst_window(x, w, a, b))
 }

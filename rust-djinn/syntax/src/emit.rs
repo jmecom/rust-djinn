@@ -224,6 +224,8 @@ pub fn is_obligation_kind(ob: &str) -> bool {
 
 pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
     let mut v = Vec::new();
+    let mut used: std::collections::HashSet<String> = d.inputs.iter().chain(&d.outputs).chain(&d.impl_params).map(|(n, _)| n.clone()).collect();
+    used.extend(d.choices.iter().map(|(n, _)| n.clone()));
     let ins = binders(cx, &d.inputs, true);
     let in_names = names(&d.inputs);
     let out_names = names(&d.outputs);
@@ -239,13 +241,14 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
 
     if d.kind == Kind::Func {
         // unambiguity — modulo the choices, own and lifted alike
-        let o1: Vec<(String, RType)> = d.outputs.iter().enumerate().map(|(i, (_, t))| (format!("o{}₁", i), t.clone())).collect();
-        let o2: Vec<(String, RType)> = d.outputs.iter().enumerate().map(|(i, (_, t))| (format!("o{}₂", i), t.clone())).collect();
-        let (o1, o2) = if d.outputs.len() == 1 {
-            (vec![("o₁".to_string(), d.outputs[0].1.clone())], vec![("o₂".to_string(), d.outputs[0].1.clone())])
-        } else {
-            (o1, o2)
+        let mut output_copy = |suffix: &str| -> Vec<(String, RType)> {
+            d.outputs.iter().enumerate().map(|(i, (_, t))| {
+                let base = if d.outputs.len() == 1 { format!("o{suffix}") } else { format!("o{i}{suffix}") };
+                (crate::ast::fresh_name(&base, &mut used), t.clone())
+            }).collect()
         };
+        let o1 = output_copy("₁");
+        let o2 = output_copy("₂");
         let eqs: Vec<String> = o1.iter().zip(&o2).map(|((a, _), (b, _))| format!("{a} = {b}")).collect();
         let doc = if d.choices.is_empty() {
             "GUARANTEE: for fixed inputs, any two outputs satisfying the relation are\n    equal — the declaration denotes a (partial) function. Ambiguity inherited\n    from mentioned rels must be resolved here.".to_string()
@@ -325,6 +328,10 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
             ),
             generated_proof: None,
         });
+        // The generated tactic's local hypotheses must also avoid user parameters.
+        let h_pre = crate::ast::fresh_name("h_pre_", &mut used);
+        let h_impl = crate::ast::fresh_name("h_impl_", &mut used);
+        let h_post = crate::ast::fresh_name("h_post_", &mut used);
         // existence, derived
         let ex_names: Vec<String> = outs.iter().map(|(n, _)| n.clone()).collect();
         v.push(Obligation {
@@ -339,8 +346,9 @@ pub fn obligations(cx: &EmitCx, d: &Lowered) -> Vec<Obligation> {
                 ex_names.join(" ")
             ),
             generated_proof: Some(format!(
-                "by\n  intro {pnames} h_pre_\n  have h_impl_ := {}.impl_correct {pnames} h_pre_\n  rw [Aeneas.Std.WP.spec_equiv_exists] at h_impl_\n  obtain ⟨_, _, h_post_⟩ := h_impl_\n  exact ⟨_, h_post_⟩",
-                d.name
+                "by\n  intro {pnames} {h_pre}\n  have {h_impl} := {}.impl_correct {pnames} {h_pre}\n  rw [Aeneas.Std.WP.spec_equiv_exists] at {h_impl}\n  obtain ⟨_, _, {h_post}⟩ := {h_impl}\n  exact ⟨{}{h_post}⟩",
+                d.name,
+                "_, ".repeat(outs.len())
             )),
         });
     } else if d.total {
