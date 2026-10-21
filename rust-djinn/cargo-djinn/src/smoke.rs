@@ -19,8 +19,10 @@
 use crate::config::Config;
 use djinn_syntax::ast::*;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::time::{Duration, Instant};
 
 pub struct Bounds {
     pub max_len: usize,
@@ -38,93 +40,289 @@ impl Default for Bounds {
 
 // ------------------------------------------------------------------ Z3 session
 
+// Bound protocol responses as well as the solver's computation. Z3's own
+// timeout does not cover parsing errors, a broken protocol, or a stopped child.
+const MAX_SOLVER_RESPONSE: usize = 1024 * 1024;
+
+enum SolverOutput {
+    Bytes(Vec<u8>),
+    Eof,
+    Error(String),
+}
+
 struct Z3 {
     child: Child,
-    out: BufReader<std::process::ChildStdout>,
-    errors: usize,
+    input: SyncSender<String>,
+    writes: Receiver<std::result::Result<(), String>>,
+    output: Receiver<SolverOutput>,
+    pending: Vec<u8>,
+    timeout: Duration,
+    failed: Option<String>,
 }
 
 impl Z3 {
     fn start(timeout_ms: u64) -> std::result::Result<Z3, String> {
-        let mut child = Command::new("z3")
-            .args(["-in", "-smt2"])
+        let mut command = Command::new("z3");
+        command.args(["-in", "-smt2"]);
+        Self::start_command(command, timeout_ms)
+    }
+
+    fn start_command(mut command: Command, timeout_ms: u64) -> std::result::Result<Z3, String> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Diagnostics on stderr must not fill an unread pipe and stop Z3.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("cannot run z3 (is it installed?): {e}"))?;
-        let out = BufReader::new(child.stdout.take().unwrap());
-        let mut z = Z3 { child, out, errors: 0 };
-        z.send(&format!("(set-option :timeout {timeout_ms})"));
-        z.send("(set-option :produce-models true)");
-        Ok(z)
-    }
-    fn send(&mut self, s: &str) {
-        let stdin = self.child.stdin.as_mut().unwrap();
-        let _ = writeln!(stdin, "{s}");
-        let _ = stdin.flush();
-    }
-    /// Read one balanced s-expression (or a bare word) from z3.
-    fn read(&mut self) -> String {
-        let mut acc = String::new();
-        let mut depth = 0i32;
-        loop {
-            let mut line = String::new();
-            if self.out.read_line(&mut line).unwrap_or(0) == 0 {
-                return acc;
-            }
-            for c in line.chars() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => depth -= 1,
-                    _ => {}
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let (output_tx, output) = mpsc::sync_channel(8);
+        std::thread::spawn(move || {
+            let mut bytes = [0u8; 4096];
+            loop {
+                let event = match stdout.read(&mut bytes) {
+                    Ok(0) => SolverOutput::Eof,
+                    Ok(n) => SolverOutput::Bytes(bytes[..n].to_vec()),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => SolverOutput::Error(e.to_string()),
+                };
+                let terminal = !matches!(event, SolverOutput::Bytes(_));
+                if output_tx.send(event).is_err() || terminal {
+                    break;
                 }
             }
-            acc.push_str(&line);
-            if depth <= 0 && !acc.trim().is_empty() {
-                return acc.trim().to_string();
+        });
+        let (input, input_rx) = mpsc::sync_channel::<String>(1);
+        let (write_tx, writes) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            while let Ok(command) = input_rx.recv() {
+                let result = writeln!(stdin, "{command}")
+                    .and_then(|_| stdin.flush())
+                    .map_err(|e| e.to_string());
+                let terminal = result.is_err();
+                if write_tx.send(result).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        // Allow the solver to report its own timeout before our I/O watchdog.
+        // Bound even an accidental zero or enormous command-line timeout.
+        let timeout = Duration::from_millis(timeout_ms.clamp(1, 300_000) + 250);
+        let mut z = Z3 { child, input, writes, output, pending: Vec::new(), timeout, failed: None };
+        z.send(&format!("(set-option :timeout {timeout_ms})"));
+        z.send("(set-option :produce-models true)");
+        z.failure()?;
+        Ok(z)
+    }
+
+    fn failure(&self) -> std::result::Result<(), String> {
+        match &self.failed {
+            Some(message) => Err(message.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn fail(&mut self, message: impl Into<String>) {
+        if self.failed.is_none() {
+            self.failed = Some(format!("z3 protocol error: {}", message.into()));
+            // Stop a poisoned session immediately; later commands must never
+            // produce results from only the assertions the solver accepted.
+            let _ = self.child.kill();
+        }
+    }
+
+    fn send(&mut self, s: &str) {
+        if self.failed.is_some() {
+            return;
+        }
+        if let Err(e) = self.input.try_send(s.to_owned()) {
+            self.fail(format!("cannot send command: {e}"));
+            return;
+        }
+        match self.writes.recv_timeout(self.timeout) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => self.fail(format!("cannot write command: {e}")),
+            Err(mpsc::RecvTimeoutError::Timeout) => self.fail("timed out writing a command"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.fail("solver input closed"),
+        }
+    }
+
+    /// Read one SMT response, ignoring parentheses inside quoted text. Each
+    /// response has a size limit and wall-clock deadline independent of Z3.
+    fn read(&mut self) -> String {
+        if self.failed.is_some() {
+            return String::new();
+        }
+        let result: R<String> = (|| {
+            let deadline = Instant::now() + self.timeout;
+            loop {
+                if let Some((start, end)) = solver_response_end(&self.pending)? {
+                    let bytes: Vec<u8> = self.pending.drain(..end).collect();
+                    let text = std::str::from_utf8(&bytes[start..])
+                        .map_err(|_| "response is not valid UTF-8")?.trim().to_owned();
+                    if text.strip_prefix("(error").is_some_and(|rest| {
+                        rest.starts_with(char::is_whitespace) || rest.starts_with(')')
+                    }) {
+                        return Err(text);
+                    }
+                    return Ok(text);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let bytes = match self.output.recv_timeout(remaining) {
+                    Ok(SolverOutput::Bytes(bytes)) => bytes,
+                    Ok(SolverOutput::Eof) => return Err("solver output closed before a complete response".into()),
+                    Ok(SolverOutput::Error(e)) => return Err(format!("cannot read response: {e}")),
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Err("timed out reading a complete response".into()),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("solver output closed".into()),
+                };
+                if self.pending.len().saturating_add(bytes.len()) > MAX_SOLVER_RESPONSE {
+                    return Err("response exceeded the 1 MiB limit".into());
+                }
+                self.pending.extend(bytes);
+            }
+        })();
+        match result {
+            Ok(text) => text,
+            Err(error) => {
+                self.fail(error);
+                String::new()
             }
         }
     }
+
     fn check_sat(&mut self) -> String {
         self.send("(check-sat)");
-        // skip anything that is not a verdict (an `(error …)` from an earlier
-        // command would otherwise be taken for the answer), but report it
-        for _ in 0..50 {
-            let r = self.read();
-            let t = r.trim();
-            if t == "sat" || t == "unsat" || t == "unknown" || t.is_empty() {
-                return t.to_string();
-            }
-            if std::env::var("DJINN_SMOKE_DUMP").is_ok() {
-                eprintln!(";; z3 said: {t}");
-            }
-            if t.starts_with("(error") {
-                self.errors += 1;
+        let response = self.read();
+        match response.as_str() {
+            "sat" | "unsat" | "unknown" => response,
+            _ => {
+                if self.failed.is_none() {
+                    self.fail(format!("expected sat, unsat, or unknown; received {response:?}"));
+                }
+                "unknown".into()
             }
         }
-        "unknown".into()
     }
+
     fn get_value(&mut self, vars: &[String]) -> HashMap<String, String> {
-        let mut m = HashMap::new();
-        if vars.is_empty() {
-            return m;
+        let mut values = HashMap::new();
+        if vars.is_empty() || self.failed.is_some() {
+            return values;
         }
         self.send(&format!("(get-value ({}))", vars.join(" ")));
         let text = self.read();
-        for (k, v) in parse_value_pairs(&text) {
-            m.insert(k, v);
+        if self.failed.is_some() {
+            return values;
         }
-        m
+        if !text.starts_with('(') {
+            self.fail("expected a get-value list");
+            return values;
+        }
+        for (name, value) in parse_value_pairs(&text) {
+            if !vars.contains(&name) || value.is_empty() {
+                self.fail("malformed get-value response");
+                return HashMap::new();
+            }
+            values.insert(name, value);
+        }
+        if vars.iter().any(|name| !values.contains_key(name)) {
+            self.fail("get-value response omitted a requested value");
+            return HashMap::new();
+        }
+        values
     }
 }
 
 impl Drop for Z3 {
     fn drop(&mut self) {
-        self.send("(exit)");
+        // A malformed or timed-out solver cannot be trusted to process (exit).
+        // Killing first also releases any reader/writer blocked on its pipes.
+        let _ = self.child.kill();
         let _ = self.child.wait();
     }
 }
+
+/// Return the byte range of the first complete response. SMT-LIB strings use
+/// doubled quotes, and quoted symbols and comments can contain parentheses.
+fn solver_response_end(bytes: &[u8]) -> std::result::Result<Option<(usize, usize)>, String> {
+    let mut i = 0;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b';' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else {
+            break;
+        }
+    }
+    let start = i;
+    if start == bytes.len() {
+        return Ok(None);
+    }
+    if bytes[start] == b')' {
+        return Err("unexpected closing parenthesis".into());
+    }
+    if bytes[start] != b'(' {
+        for (offset, byte) in bytes[start..].iter().enumerate() {
+            if byte.is_ascii_whitespace() {
+                return Ok(Some((start, start + offset + 1)));
+            }
+            if *byte == b'(' || *byte == b')' {
+                return Err("unexpected parenthesis in a bare response".into());
+            }
+        }
+        return Ok(None);
+    }
+    let mut depth = 0usize;
+    let mut string = false;
+    let mut symbol = false;
+    let mut comment = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if comment {
+            comment = byte != b'\n';
+        } else if string {
+            if byte == b'"' {
+                if i + 1 == bytes.len() {
+                    return Ok(None);
+                }
+                if bytes[i + 1] == b'"' {
+                    i += 1;
+                } else {
+                    string = false;
+                }
+            }
+        } else if symbol {
+            if byte == b'|' {
+                symbol = false;
+            }
+        } else {
+            match byte {
+                b';' => comment = true,
+                b'"' => string = true,
+                b'|' => symbol = true,
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(Some((start, i + 1)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+#[path = "smoke_protocol_tests.rs"]
+mod protocol_tests;
 
 /// `((x 1) (y (- 2)) (z (some 3)))` → pairs with the value rendered humanly.
 fn parse_value_pairs(text: &str) -> Vec<(String, String)> {
@@ -200,7 +398,7 @@ enum IntT {
 impl IntT {
     fn s(&self) -> String {
         match self {
-            IntT::Lit(n) if *n < 0 => format!("(- {})", -n),
+            IntT::Lit(n) if *n < 0 => format!("(- {})", n.unsigned_abs()),
             IntT::Lit(n) => n.to_string(),
             IntT::Term(t) => t.clone(),
         }
@@ -259,14 +457,14 @@ fn arith(op: &str, a: &IntT, b: &IntT) -> IntT {
                 if y == 0 {
                     None
                 } else {
-                    Some(x.div_euclid(y))
+                    x.checked_div_euclid(y)
                 }
             }
             "mod" => {
                 if y == 0 {
                     None
                 } else {
-                    Some(x.rem_euclid(y))
+                    x.checked_rem_euclid(y)
                 }
             }
             _ => None,
@@ -278,27 +476,60 @@ fn arith(op: &str, a: &IntT, b: &IntT) -> IntT {
     IntT::Term(format!("({op} {} {})", a.s(), b.s()))
 }
 
-fn scalar_range(t: &RType) -> Option<(i128, i128)> {
+fn scalar_range(t: &RType) -> Option<(String, String)> {
     match t {
-        RType::Char => Some((0, 0x10FFFF)),
+        RType::Char => Some(("0".into(), "1114111".into())),
         RType::Int { signed, bits } => {
             let b = if *bits == 0 { 64 } else { *bits } as u32;
             if *signed {
-                Some((-(1i128 << (b - 1)), (1i128 << (b - 1)) - 1))
+                let magnitude = 1u128 << (b - 1);
+                Some((format!("(- {magnitude})"), (magnitude - 1).to_string()))
             } else {
-                Some((0, (1i128 << b) - 1))
+                let max = if b == 128 { u128::MAX } else { (1u128 << b) - 1 };
+                Some(("0".into(), max.to_string()))
             }
         }
         _ => None,
     }
 }
 
-fn big(n: i128) -> String {
-    if n < 0 {
-        format!("(- {})", -n)
-    } else {
-        n.to_string()
+/// SMT integers are unbounded; preserve the complete Rust range, including
+/// u128::MAX, without passing either endpoint through a signed host integer.
+fn type_ranges(term: &str, ty: &RType, types: &TypeDefs, small: bool, bound: i64) -> Vec<String> {
+    fn visit(term: &str, ty: &RType, types: &TypeDefs, small: bool, bound: i64, seen: &mut Vec<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some((lo, hi)) = scalar_range(ty) {
+            out.push(format!("(and (<= {lo} {term}) (<= {term} {hi}))"));
+            if matches!(ty, RType::Char) {
+                out.push(format!("(or (< {term} 55296) (> {term} 57343))"));
+            }
+        }
+        if small && matches!(ty, RType::Int { .. } | RType::Char | RType::MathInt) {
+            out.push(format!("(and (<= (- {bound}) {term}) (<= {term} {bound}))"));
+        }
+        match ty {
+            RType::Option(inner) => {
+                let inner = visit(&format!("(val {term})"), inner, types, small, bound, seen);
+                out.push(imp(&format!("((_ is some) {term})"), &and(inner)));
+            }
+            RType::Named(en) if !seen.contains(en) => {
+                seen.push(en.clone());
+                if let Some(e) = types.enums.get(en) {
+                    for v in &e.variants {
+                        let mut fields = Vec::new();
+                        for (k, (_, ty)) in v.fields.iter().enumerate() {
+                            fields.extend(visit(&format!("({}_f{k} {term})", v.name), ty, types, small, bound, seen));
+                        }
+                        out.push(imp(&format!("((_ is {}) {term})", v.name), &and(fields)));
+                    }
+                }
+                seen.pop();
+            }
+            _ => {}
+        }
+        out
     }
+    visit(term, ty, types, small, bound, &mut Vec::new())
 }
 
 // -------------------------------------------------------------------- lowering
@@ -311,18 +542,18 @@ struct Lo<'a> {
     env: HashMap<String, Val>,
     /// `v` → `v_old` while lowering a `requires`
     pre_scope: bool,
-    muts: Vec<String>,
+    muts: HashMap<String, String>,
     /// declarations of fresh symbols (lifted calls)
     decls_out: Vec<String>,
     /// side constraints (lifted call specs)
     side: Vec<String>,
+    /// Existential outputs of value-position calls, closed at their predicate.
+    locals: Vec<String>,
+    steps: usize,
     /// well-formedness violations: (formula, description); a violation under a
     /// quantifier is existential in the quantifier's variables
     wf: Vec<(String, String)>,
     cx: Vec<String>,
-    /// the SMT binders of the quantifiers in scope (`(k_q0 Int)`), so that a
-    /// guard inside a `forall`/`exists` body can refer to their variables
-    quant: Vec<String>,
     fresh: usize,
     needs_opt: bool,
     /// user enums whose SMT datatype the query needs
@@ -375,49 +606,69 @@ fn datatype_decl(e: &EnumDef, types: &TypeDefs) -> R<String> {
 /// Range constraints on the scalar fields of an enum-typed symbol (every
 /// variant's fields within their machine ranges, or the small bound).
 fn data_ranges(nm: &str, en: &str, types: &TypeDefs, small: bool, int_bound: i64) -> Vec<String> {
-    let mut out = Vec::new();
-    let Some(e) = types.enums.get(en) else { return out };
-    for v in &e.variants {
-        let mut conds = Vec::new();
-        for (k, (_, t)) in v.fields.iter().enumerate() {
-            if let Some((lo, hi)) = scalar_range(t) {
-                let (lo, hi) = if small { (lo.max(-(int_bound as i128)), hi.min(int_bound as i128)) } else { (lo, hi) };
-                let sel = format!("({}_f{k} {nm})", v.name);
-                conds.push(format!("(and (<= {} {sel}) (<= {sel} {}))", big(lo), big(hi)));
-            }
-        }
-        if !conds.is_empty() {
-            out.push(format!("(=> ((_ is {}) {nm}) {})", v.name, and(conds)));
-        }
-    }
-    out
+    type_ranges(nm, &RType::Named(en.into()), types, small, int_bound)
 }
 
-/// Datatype declarations in dependency order (an enum before the enums that mention it).
-fn datatype_decls(names: &[String], types: &TypeDefs) -> R<Vec<String>> {
-    let mut order: Vec<String> = Vec::new();
-    fn visit(n: &str, types: &TypeDefs, order: &mut Vec<String>) {
-        if order.iter().any(|x| x == n) {
-            return;
-        }
-        if let Some(e) = types.enums.get(n) {
-            for v in &e.variants {
-                for (_, t) in &v.fields {
-                    if let RType::Named(m) = t {
-                        visit(m, types, order);
-                    }
+/// Dependencies include Option fields, not only other named enums. Cyclic
+/// datatypes require a mutual declaration that this bounded encoding rejects.
+fn datatype_decls(names: &[String], types: &TypeDefs, needs_opt: bool) -> R<Vec<String>> {
+    fn visit(n: &str, types: &TypeDefs, order: &mut Vec<String>, visiting: &mut Vec<String>, opt: &mut bool) -> R<()> {
+        if order.iter().any(|x| x == n) { return Ok(()); }
+        if visiting.iter().any(|x| x == n) { return Err("recursive enum types are not supported by smoke-test".into()); }
+        visiting.push(n.into());
+        let e = types.enums.get(n).ok_or_else(|| format!("unknown enum `{n}`"))?;
+        for v in &e.variants {
+            for (_, t) in &v.fields {
+                match t {
+                    RType::Named(m) => visit(m, types, order, visiting, opt)?,
+                    RType::Option(_) => *opt = true,
+                    _ => {}
                 }
             }
         }
+        visiting.pop();
         order.push(n.to_string());
+        Ok(())
     }
-    for n in names {
-        visit(n, types, &mut order);
-    }
-    order.iter().map(|n| datatype_decl(types.enums.get(n).ok_or_else(|| format!("unknown enum `{n}`"))?, types)).collect()
+    let mut order = Vec::new();
+    let mut opt = needs_opt;
+    for n in names { visit(n, types, &mut order, &mut Vec::new(), &mut opt)?; }
+    let mut out = Vec::new();
+    if opt { out.push("(declare-datatype OptInt ((none) (some (val Int))))".into()); }
+    for n in order { out.push(datatype_decl(&types.enums[&n], types)?); }
+    Ok(out)
+}
+
+fn old_inputs(d: &Decl) -> HashMap<String, String> {
+    d.params.iter().zip(d.inputs()).filter(|(p, _)| p.mut_ref)
+        .map(|(p, (n, _))| (p.name.clone(), n)).collect()
+}
+
+fn exists(vars: &[String], body: String) -> String {
+    if vars.is_empty() { body } else { format!("(exists ({}) {body})", vars.join(" ")) }
 }
 
 impl<'a> Lo<'a> {
+    fn scoped(&mut self, f: impl FnOnce(&mut Self) -> R<String>) -> R<String> {
+        self.steps += 1;
+        if self.steps > 50_000 { return Err("smoke-test lowering exceeds its expansion budget".into()); }
+        let (ns, nv, nw) = (self.side.len(), self.locals.len(), self.wf.len());
+        let body = f(self)?;
+        let side: Vec<_> = self.side.drain(ns..).collect();
+        let vars: Vec<_> = self.locals.drain(nv..).collect();
+        let assumptions = and(side);
+        self.bind_wf(nw, &vars, &assumptions);
+        let result = exists(&vars, and(vec![assumptions, body]));
+        if result.len() > 4 * 1024 * 1024 { return Err("smoke-test formula exceeds its size budget".into()); }
+        Ok(result)
+    }
+
+    fn bind_wf(&mut self, start: usize, vars: &[String], admissible: &str) {
+        for (violation, _) in &mut self.wf[start..] {
+            *violation = exists(vars, and(vec![admissible.to_string(), violation.clone()]));
+        }
+    }
+
     fn ctx(&self) -> String {
         and(self.cx.clone())
     }
@@ -425,7 +676,6 @@ impl<'a> Lo<'a> {
     fn guard(&mut self, g: String, what: String) {
         let c = self.ctx();
         let v = and(vec![c, not(&g)]);
-        let v = if self.quant.is_empty() { v } else { format!("(exists ({}) {})", self.quant.join(" "), v) };
         self.wf.push((v, what));
     }
 
@@ -475,7 +725,7 @@ impl<'a> Lo<'a> {
         }
         if self.choices_local {
             // an existential over the rest of the block, as `some`
-            let nm = format!("{name}_e{}", self.fresh);
+            let nm = format!("djinn!e{}", self.fresh);
             self.fresh += 1;
             let (qvar, val) = match ty {
                 RType::Bool => (format!("({nm} Bool)"), Val::Bool(nm.clone())),
@@ -487,14 +737,15 @@ impl<'a> Lo<'a> {
                 _ => return Err(format!("a choice (`any {name}`) of type {} under a binder is not supported by smoke-test", djinn_syntax::types::rust_type(ty))),
             };
             let ranges = self.choice_ranges(ty, &nm);
-            self.quant.push(qvar.clone());
+            let nw = self.wf.len();
             let b = self.with(vec![(name.to_string(), val)], |l| {
                 let w = l.constraint(wherec)?;
                 let r = l.stmts(rest)?;
                 Ok(and(vec![w, r]))
             })?;
-            self.quant.pop();
-            return Ok(format!("(exists ({qvar}) {})", and(ranges.into_iter().chain([b]).collect())));
+            let inner = and(ranges.into_iter().chain([b]).collect());
+            self.bind_wf(nw, &[qvar.clone()], &inner);
+            return Ok(exists(&[qvar], inner));
         }
         // free: an uninterpreted function of the binders in scope
         let (val, ranges) = self.any_fun(name, ty)?;
@@ -529,7 +780,7 @@ impl<'a> Lo<'a> {
         let sym = match self.choice_fns.iter().find(|(k, _)| k == &key) {
             Some((_, sym)) => sym.clone(),
             None => {
-                let sym = format!("{name}_c{}", self.choice_fns.len());
+                let sym = format!("djinn!choice{}", self.choice_fns.len());
                 self.decls_out.push(format!("(declare-fun {sym} ({}) {sort})", sorts.join(" ")));
                 self.choice_fns.push((key, sym.clone()));
                 sym
@@ -543,19 +794,14 @@ impl<'a> Lo<'a> {
     /// The range of a choice's value: its Rust type's, within the small
     /// regime's bound.
     fn choice_ranges(&self, ty: &RType, term: &str) -> Vec<String> {
-        let mut v = Vec::new();
-        if let Some((lo, hi)) = scalar_range(ty) {
-            let b = self.bounds.int_bound as i128;
-            let (lo, hi) = if self.small { (lo.max(-b), hi.min(b)) } else { (lo, hi) };
-            v.push(format!("(and (<= {} {term}) (<= {term} {}))", big(lo), big(hi)));
-        }
-        if let RType::Named(en) = ty {
-            v.extend(data_ranges(term, en, self.types, self.small, self.bounds.int_bound));
-        }
-        v
+        type_ranges(term, ty, self.types, self.small, self.bounds.int_bound)
     }
 
     fn stmt(&mut self, s: &Stmt) -> R<String> {
+        self.scoped(|l| l.stmt_inner(s))
+    }
+
+    fn stmt_inner(&mut self, s: &Stmt) -> R<String> {
         match &s.kind {
             StmtKind::Constraint(e) => self.constraint(e),
             StmtKind::Any { name, ty, wherec } => self.any_block(name, ty, wherec, &[]),
@@ -578,45 +824,30 @@ impl<'a> Lo<'a> {
                 let lo = self.num(lo)?;
                 let hi = self.num(hi)?;
                 if let (Some(a), Some(b)) = (lo.lit(), hi.lit()) {
-                    let mut v = Vec::new();
-                    for k in a..b {
-                        self.binds.push(Some((IntT::Lit(k).s(), "Int".into())));
-                        let r = self.with(vec![(var.clone(), Val::Int(IntT::Lit(k)))], |l| l.stmts(body));
-                        self.binds.pop();
-                        v.push(r?);
+                    if b.saturating_sub(a) <= 256 {
+                        let mut v = Vec::new();
+                        for k in a..b {
+                            self.binds.push(Some((IntT::Lit(k).s(), "Int".into())));
+                            let r = self.with(vec![(var.clone(), Val::Int(IntT::Lit(k)))], |l| l.stmts(body));
+                            self.binds.pop();
+                            v.push(r?);
+                        }
+                        return Ok(and(v));
                     }
-                    return Ok(and(v));
                 }
-                if self.small {
-                    // expand over the small range, and keep the range inside it
-                    let b = self.bounds.int_bound;
-                    let mut v = Vec::new();
-                    for k in -b..=b {
-                        let inside = format!("(and (<= {} {k}) (< {k} {}))", lo.s(), hi.s());
-                        self.cx.push(inside.clone());
-                        self.binds.push(Some((IntT::Lit(k).s(), "Int".into())));
-                        let body_s = self.with(vec![(var.clone(), Val::Int(IntT::Lit(k)))], |l| l.stmts(body));
-                        self.binds.pop();
-                        self.cx.pop();
-                        let body_s = body_s?;
-                        v.push(imp(&inside, &body_s));
-                    }
-                    self.side.push(format!("(and (<= (- {b}) {}) (<= {} (+ {b} 1)))", lo.s(), hi.s()));
-                    Ok(and(v))
-                } else {
-                    let i = format!("{var}_q{}", self.fresh);
-                    self.fresh += 1;
-                    let inside = format!("(and (<= {} {i}) (< {i} {}))", lo.s(), hi.s());
-                    self.cx.push(inside.clone());
-                    self.quant.push(format!("({i} Int)"));
-                    self.binds.push(Some((i.clone(), "Int".into())));
-                    let body_s = self.with(vec![(var.clone(), Val::Int(IntT::Term(i.clone())))], |l| l.stmts(body));
-                    self.binds.pop();
-                    self.quant.pop();
-                    let body_s = body_s?;
-                    self.cx.pop();
-                    Ok(format!("(forall (({i} Int)) {})", imp(&inside, &body_s)))
-                }
+                let i = format!("djinn!q{}", self.fresh);
+                self.fresh += 1;
+                let qvar = format!("({i} Int)");
+                let inside = format!("(and (<= {} {i}) (< {i} {}))", lo.s(), hi.s());
+                let nw = self.wf.len();
+                self.cx.push(inside.clone());
+                self.binds.push(Some((i.clone(), "Int".into())));
+                let body_s = self.with(vec![(var.clone(), Val::Int(IntT::Term(i)))], |l| l.stmts(body));
+                self.binds.pop();
+                self.cx.pop();
+                let body_s = body_s?;
+                self.bind_wf(nw, &[qvar.clone()], &inside);
+                Ok(format!("(forall ({qvar}) {})", imp(&inside, &body_s)))
             }
             StmtKind::Some { binders, body } => {
                 let mut qvars = Vec::new();
@@ -625,22 +856,20 @@ impl<'a> Lo<'a> {
                 for (n, t) in binders {
                     match t {
                         RType::Int { .. } | RType::Bool | RType::MathInt | RType::Char => {
-                            let nm = format!("{n}_e{}", self.fresh);
+                            let nm = format!("djinn!e{}", self.fresh);
                             self.fresh += 1;
                             if *t == RType::Bool {
                                 qvars.push(format!("({nm} Bool)"));
                                 binds.push((n.clone(), Val::Bool(nm)));
                             } else {
                                 qvars.push(format!("({nm} Int)"));
-                                if let Some(r) = scalar_range(t) {
-                                    ranges.push(format!("(and (<= {} {nm}) (<= {nm} {}))", big(r.0), big(r.1)));
-                                }
+                                ranges.extend(type_ranges(&nm, t, self.types, false, self.bounds.int_bound));
                                 binds.push((n.clone(), Val::Int(IntT::Term(nm))));
                             }
                         }
                         RType::Named(en) if self.types.enums.contains_key(en) => {
                             self.use_datatype(en);
-                            let nm = format!("{n}_e{}", self.fresh);
+                            let nm = format!("djinn!e{}", self.fresh);
                             self.fresh += 1;
                             qvars.push(format!("({nm} {en})"));
                             ranges.extend(data_ranges(&nm, en, self.types, false, self.bounds.int_bound));
@@ -649,12 +878,11 @@ impl<'a> Lo<'a> {
                         _ => return Err("`some` binders of sequence or other types are not supported by smoke-test".into()),
                     }
                 }
-                let nq = qvars.len();
-                self.quant.extend(qvars.iter().cloned());
+                let nw = self.wf.len();
                 let b = self.with(binds, |l| l.stmts(body))?;
-                self.quant.truncate(self.quant.len() - nq);
                 let inner = and(ranges.into_iter().chain(std::iter::once(b)).collect());
-                Ok(format!("(exists ({}) {})", qvars.join(" "), inner))
+                self.bind_wf(nw, &qvars, &inner);
+                Ok(exists(&qvars, inner))
             }
             StmtKind::Cases(alts) => {
                 let mut v = Vec::new();
@@ -762,6 +990,10 @@ impl<'a> Lo<'a> {
     }
 
     fn constraint(&mut self, e: &Expr) -> R<String> {
+        self.scoped(|l| l.constraint_inner(e))
+    }
+
+    fn constraint_inner(&mut self, e: &Expr) -> R<String> {
         // `A && B`, `A || B`, `A => B`: the right operand is read under the left's
         // truth (resp. falsity); its guards and lifted calls are scoped there.
         if let ExprKind::Bin(op @ (BinOp::And | BinOp::Or), l, r) = &e.kind {
@@ -799,7 +1031,7 @@ impl<'a> Lo<'a> {
         self.prop(e)
     }
 
-    /// Inline `f_spec args out` (the callee's pre and body), recording the
+    /// Inline the callee relation, recording the
     /// callee's precondition as a call-site guard.
     fn inline_call(&mut self, f: &str, args: &[Expr], out: Val) -> R<String> {
         if self.types.ambient.contains_key(f) {
@@ -832,7 +1064,7 @@ impl<'a> Lo<'a> {
             env.insert(n.clone(), v.clone());
         }
         self.env = env;
-        self.muts = d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect();
+        self.muts = old_inputs(d);
         self.pre_scope = true;
         let mut pre = Vec::new();
         let res = (|| -> R<(String, String)> {
@@ -857,6 +1089,10 @@ impl<'a> Lo<'a> {
     }
 
     fn prop(&mut self, e: &Expr) -> R<String> {
+        self.scoped(|l| l.prop_inner(e))
+    }
+
+    fn prop_inner(&mut self, e: &Expr) -> R<String> {
         Ok(match &e.kind {
             ExprKind::Bool(b) => b.to_string(),
             ExprKind::Not(x) => not(&self.prop(x)?),
@@ -936,24 +1172,27 @@ impl<'a> Lo<'a> {
                 let xv = self.term(x)?;
                 let mut qvars = Vec::new();
                 let mut args = Vec::new();
+                let mut ranges = Vec::new();
+                let mut binds = Vec::new();
                 for p in &d.params {
                     match &p.ty {
                         RType::Int { .. } => {
-                            let nm = format!("{}_r{}", p.name, self.fresh);
+                            let nm = format!("djinn!range{}", self.fresh);
                             self.fresh += 1;
                             qvars.push(format!("({nm} Int)"));
                             args.push(Expr::new(e.span, ExprKind::Var(nm.clone())));
-                            self.env.insert(nm.clone(), Val::Int(IntT::Term(nm)));
+                            ranges.extend(type_ranges(&nm, &p.ty, self.types, false, self.bounds.int_bound));
+                            binds.push((nm.clone(), Val::Int(IntT::Term(nm))));
                         }
                         _ => return Err("`in range(f)` is only supported for scalar-input functions".into()),
                     }
                 }
-                let body = self.inline_call(f, &args, xv)?;
-                if qvars.is_empty() {
-                    body
-                } else {
-                    format!("(exists ({}) {})", qvars.join(" "), body)
-                }
+                let nw = self.wf.len();
+                // Range membership always denotes the full relation, including
+                // the callee's domain. It is not an invocation requiring a guard.
+                let body = self.with(binds, |l| l.inline_call(f, &args, xv))?;
+                self.wf.truncate(nw); // membership does not invoke the function
+                exists(&qvars, and(ranges.into_iter().chain([body]).collect()))
             }
             ExprKind::InDomain(_, _) => return Err("`in domain(f)` is not supported by smoke-test yet".into()),
             ExprKind::Method(m) => match &**m {
@@ -1064,12 +1303,16 @@ impl<'a> Lo<'a> {
 
     fn term(&mut self, e: &Expr) -> R<Val> {
         Ok(match &e.kind {
-            ExprKind::Int(s) => Val::Int(IntT::Lit(s.parse::<i64>().map_err(|_| format!("integer literal `{s}` too large"))?)),
+            ExprKind::Int(s) => Val::Int(match s.parse::<i64>() {
+                Ok(n) => IntT::Lit(n),
+                Err(_) if s.len() <= 4096 && s.bytes().all(|b| b.is_ascii_digit()) => IntT::Term(s.clone()),
+                Err(_) => return Err("integer literal exceeds smoke-test numeral budget".into()),
+            }),
             ExprKind::Bool(b) => Val::Bool(b.to_string()),
             ExprKind::Char(c) => Val::Int(IntT::Lit(*c as i64)),
             ExprKind::Str(b) => Val::Seq(b.iter().map(|x| Val::Int(IntT::Lit(*x as i64))).collect()),
             ExprKind::Var(v) => {
-                let name = if self.pre_scope && self.muts.contains(v) { format!("{v}_old") } else { v.clone() };
+                let name = if self.pre_scope { self.muts.get(v).cloned().unwrap_or_else(|| v.clone()) } else { v.clone() };
                 match self.env.get(&name).cloned() {
                     Some(val) => val,
                     None => {
@@ -1081,7 +1324,7 @@ impl<'a> Lo<'a> {
                     }
                 }
             }
-            ExprKind::Old(v) => self.env.get(&format!("{v}_old")).cloned().ok_or_else(|| format!("`old({v})`: not a `&mut` parameter"))?,
+            ExprKind::Old(v) => self.muts.get(v).and_then(|old| self.env.get(old)).cloned().ok_or_else(|| format!("`old({v})`: not a `&mut` parameter"))?,
             ExprKind::Neg(x) => {
                 let t = self.num(x)?;
                 Val::Int(arith("-", &IntT::Lit(0), &t))
@@ -1185,8 +1428,19 @@ impl<'a> Lo<'a> {
             }
             ExprKind::IfVal(c, a, b) => {
                 let cp = self.prop(c)?;
+                self.cx.push(cp.clone());
+                let ns = self.side.len();
                 let av = self.term(a)?;
+                let sides: Vec<_> = self.side.drain(ns..).collect();
+                self.side.push(imp(&cp, &and(sides)));
+                self.cx.pop();
+                let nc = not(&cp);
+                self.cx.push(nc.clone());
+                let ns = self.side.len();
                 let bv = self.term(b)?;
+                let sides: Vec<_> = self.side.drain(ns..).collect();
+                self.side.push(imp(&nc, &and(sides)));
+                self.cx.pop();
                 match (av, bv) {
                     (Val::Int(x), Val::Int(y)) => Val::Int(IntT::Term(format!("(ite {cp} {} {})", x.s(), y.s()))),
                     (Val::Bool(x), Val::Bool(y)) => Val::Bool(format!("(ite {cp} {x} {y})")),
@@ -1230,8 +1484,8 @@ impl<'a> Lo<'a> {
                 Method::Abs(x) => {
                     let t = self.num(x)?;
                     Val::Int(match t.lit() {
-                        Some(k) => IntT::Lit(k.abs()),
-                        None => IntT::Term(format!("(ite (< {} 0) (- {}) {})", t.s(), t.s(), t.s())),
+                        Some(k) if k.checked_abs().is_some() => IntT::Lit(k.checked_abs().unwrap()),
+                        _ => IntT::Term(format!("(ite (< {} 0) (- {}) {})", t.s(), t.s(), t.s())),
                     })
                 }
                 Method::Min(a, b) | Method::Max(a, b) => {
@@ -1246,11 +1500,14 @@ impl<'a> Lo<'a> {
                 Method::Pow(a, n) => {
                     let x = self.num(a)?;
                     let k = self.num(n)?.lit().ok_or("`.pow(n)` needs a literal exponent in smoke-test")?;
-                    if k < 0 {
-                        return Err("negative exponent".into());
+                    if !(0..=256).contains(&k) {
+                        return Err("smoke-test supports literal exponents from 0 through 256".into());
                     }
                     let mut t = IntT::Lit(1);
                     for _ in 0..k {
+                        if t.s().len().saturating_add(x.s().len()) > 4 * 1024 * 1024 {
+                            return Err("smoke-test power exceeds its formula size budget".into());
+                        }
                         t = arith("*", &t, &x);
                     }
                     Val::Int(t)
@@ -1266,39 +1523,19 @@ impl<'a> Lo<'a> {
                 _ => return Err("unsupported method in smoke-test".into()),
             },
             ExprKind::Call(f, args) => {
-                // nested call in value position: fresh output symbol + the callee's spec as a side constraint
+                // Value calls introduce an existential at the surrounding predicate.
+                // Neither the result nor its relation may escape a branch or binder.
                 let d = *self.decls.get(f).ok_or_else(|| format!("unknown function `{f}`"))?;
                 let outs = d.outputs();
                 if outs.len() != 1 {
                     return Err(format!("`{f}` must have one output to be used as a value"));
                 }
-                let out = match &outs[0].1 {
-                    RType::Int { .. } | RType::MathInt | RType::Char => {
-                        let nm = format!("{f}_out{}", self.fresh);
-                        self.fresh += 1;
-                        self.decls_out.push(format!("(declare-const {nm} Int)"));
-                        if let Some(r) = scalar_range(&outs[0].1) {
-                            self.side.push(format!("(and (<= {} {nm}) (<= {nm} {}))", big(r.0), big(r.1)));
-                        }
-                        Val::Int(IntT::Term(nm))
-                    }
-                    RType::Bool => {
-                        let nm = format!("{f}_out{}", self.fresh);
-                        self.fresh += 1;
-                        self.decls_out.push(format!("(declare-const {nm} Bool)"));
-                        Val::Bool(nm)
-                    }
-                    RType::Named(en) if self.types.enums.contains_key(en) => {
-                        self.use_datatype(en);
-                        let nm = format!("{f}_out{}", self.fresh);
-                        self.fresh += 1;
-                        self.decls_out.push(format!("(declare-const {nm} {en})"));
-                        let rs = data_ranges(&nm, en, self.types, false, self.bounds.int_bound);
-                        self.side.extend(rs);
-                        Val::Data(nm, en.clone())
-                    }
-                    _ => return Err(format!("nested call to `{f}` returning a sequence/Option is not supported; write `{f}(..) == v;`")),
-                };
+                let nm = format!("djinn!call{}", self.fresh);
+                self.fresh += 1;
+                let sort = sort_of(&outs[0].1, self.types)?;
+                self.locals.push(format!("({nm} {sort})"));
+                self.side.extend(type_ranges(&nm, &outs[0].1, self.types, false, self.bounds.int_bound));
+                let out = self.val_of_sort(&outs[0].1, nm)?;
                 let spec = self.inline_call(f, args, out.clone())?;
                 self.side.push(spec);
                 out
@@ -1354,27 +1591,24 @@ fn declare(prefix: &str, name: &str, ty: &RType, len: usize, decls: &mut Vec<Str
         }
     };
     let range_assert = |nm: &str, t: &RType, side: &mut Vec<String>| {
-        if let Some((lo, hi)) = scalar_range(t) {
-            let (lo, hi) = if small { (lo.max(-(int_bound as i128)), hi.min(int_bound as i128)) } else { (lo, hi) };
-            side.push(format!("(and (<= {} {nm}) (<= {nm} {}))", big(lo), big(hi)));
-        }
+        side.extend(type_ranges(nm, t, types, small, int_bound));
     };
     Ok(match ty {
         RType::Int { .. } | RType::Char => {
-            let nm = format!("{prefix}{name}");
+            let nm = format!("djinn!{prefix}{name}");
             decls.push(format!("(declare-const {nm} Int)"));
             range_assert(&nm, ty, side);
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Int(IntT::Term(nm)))
         }
         RType::Named(en) if types.enums.contains_key(en) => {
             use_dt(en);
-            let nm = format!("{prefix}{name}");
+            let nm = format!("djinn!{prefix}{name}");
             decls.push(format!("(declare-const {nm} {en})"));
             side.extend(data_ranges(&nm, en, types, small, int_bound));
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Data(nm, en.clone()))
         }
         RType::MathInt => {
-            let nm = format!("{prefix}{name}");
+            let nm = format!("djinn!{prefix}{name}");
             decls.push(format!("(declare-const {nm} Int)"));
             if small {
                 side.push(format!("(and (<= (- {int_bound}) {nm}) (<= {nm} {int_bound}))"));
@@ -1382,25 +1616,22 @@ fn declare(prefix: &str, name: &str, ty: &RType, len: usize, decls: &mut Vec<Str
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Int(IntT::Term(nm)))
         }
         RType::Bool => {
-            let nm = format!("{prefix}{name}");
+            let nm = format!("djinn!{prefix}{name}");
             decls.push(format!("(declare-const {nm} Bool)"));
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Bool(nm))
         }
         RType::Option(inner) if matches!(**inner, RType::Int { .. }) => {
             *needs_opt = true;
-            let nm = format!("{prefix}{name}");
+            let nm = format!("djinn!{prefix}{name}");
             decls.push(format!("(declare-const {nm} OptInt)"));
-            if let Some((lo, hi)) = scalar_range(inner) {
-                let (lo, hi) = if small { (lo.max(-(int_bound as i128)), hi.min(int_bound as i128)) } else { (lo, hi) };
-                side.push(format!("(=> ((_ is some) {nm}) (and (<= {} (val {nm})) (<= (val {nm}) {})))", big(lo), big(hi)));
-            }
+            side.extend(type_ranges(&nm, ty, types, small, int_bound));
             (Sym { name: name.into(), ty: ty.clone(), smt: vec![nm.clone()] }, Val::Opt(nm))
         }
         RType::Seq(elem, _) => {
             let mut smt = Vec::new();
             let mut vals = Vec::new();
             for k in 0..len {
-                let nm = format!("{prefix}{name}_{k}");
+                let nm = format!("djinn!{prefix}{name}!{k}");
                 match &**elem {
                     RType::Int { .. } | RType::Char => {
                         decls.push(format!("(declare-const {nm} Int)"));
@@ -1482,12 +1713,13 @@ fn explain(
         small,
         env: HashMap::new(),
         pre_scope: true,
-        muts: d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect(),
+        muts: old_inputs(d),
         decls_out: Vec::new(),
         side: Vec::new(),
+        locals: Vec::new(),
+        steps: 0,
         wf: Vec::new(),
         cx: Vec::new(),
-        quant: Vec::new(),
         fresh: 0,
         needs_opt: false,
         datatypes: Vec::new(),
@@ -1526,11 +1758,8 @@ fn explain(
         named.push((format!("stmt_{k}"), t, false, k));
     }
     let mut header = String::new();
-    if needs_opt || lo.needs_opt {
-        header.push_str("(declare-datatype OptInt ((none) (some (val Int))))\n");
-    }
     dts.extend(lo.datatypes.iter().cloned());
-    for l in datatype_decls(&dts, types)? {
+    for l in datatype_decls(&dts, types, needs_opt || lo.needs_opt)? {
         header.push_str(&l);
         header.push('\n');
     }
@@ -1550,7 +1779,7 @@ fn explain(
             }
         }
     }
-    let run = |z3: &mut Z3, subset: &[usize]| -> String {
+    let run = |z3: &mut Z3, subset: &[usize]| -> R<String> {
         z3.send("(reset)");
         z3.send(&format!("(set-option :timeout {})", bounds.timeout_ms));
         z3.send("(set-option :produce-models true)");
@@ -1562,14 +1791,18 @@ fn explain(
             let (name, term, _, _) = &named[i];
             z3.send(&format!("(assert (! {term} :named {name}))"));
         }
-        z3.check_sat()
+        let result = z3.check_sat();
+        z3.failure()?;
+        Ok(result)
     };
     let all: Vec<usize> = (0..named.len()).collect();
-    if !run(z3, &all).starts_with("unsat") {
+    let verdict = run(z3, &all)?;
+    if !verdict.starts_with("unsat") {
         return Ok(None);
     }
     z3.send("(get-unsat-core)");
     let core_text = z3.read();
+    z3.failure()?;
     let mut core: Vec<usize> = core_text
         .trim_matches(|c| c == '(' || c == ')')
         .split_whitespace()
@@ -1583,7 +1816,7 @@ fn explain(
     let mut i = 0;
     while i < core.len() && core.len() > 1 {
         let trial: Vec<usize> = core.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, &x)| x).collect();
-        if run(z3, &trial).starts_with("unsat") {
+        if run(z3, &trial)?.starts_with("unsat") {
             core = trial;
         } else {
             i += 1;
@@ -1591,9 +1824,10 @@ fn explain(
     }
     // an example input admitted by the requires clauses alone
     let reqs: Vec<usize> = all.iter().copied().filter(|&i| named[i].2).collect();
-    let example = if fixed.is_none() && run(z3, &reqs).starts_with("sat") {
+    let example = if fixed.is_none() && run(z3, &reqs)?.starts_with("sat") {
         let vars: Vec<String> = inputs.iter().flat_map(|s| s.smt.clone()).collect();
         let m = z3.get_value(&vars);
+        z3.failure()?;
         let ins = inputs.iter().map(|s| format!("{} = {}", s.name, show(s, &m))).collect::<Vec<_>>().join(", ");
         if ins.is_empty() { None } else { Some(ins) }
     } else {
@@ -1641,12 +1875,13 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
         small,
         env: HashMap::new(),
         pre_scope: true,
-        muts: d.params.iter().filter(|p| p.mut_ref).map(|p| p.name.clone()).collect(),
+        muts: old_inputs(d),
         decls_out: Vec::new(),
         side: Vec::new(),
+        locals: Vec::new(),
+        steps: 0,
         wf: Vec::new(),
         cx: Vec::new(),
-        quant: Vec::new(),
         fresh: 0,
         needs_opt: false,
         datatypes: Vec::new(),
@@ -1701,6 +1936,9 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
         let out_max = output_len_bound(d, bounds.max_len);
         let mut out_lens = vec![HashMap::new()];
         for (v, _) in &out_seq {
+            if out_lens.len().saturating_mul(out_max.saturating_add(1)) > 4096 {
+                return Err("smoke-test output length combinations exceed 4096; lower --max-len".into());
+            }
             let mut next = Vec::new();
             for a in &out_lens {
                 for len in 0..=out_max {
@@ -1718,7 +1956,7 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
             let mut dummy = Vec::new();
             for (n, t) in d.outputs().into_iter().chain(top_choices.iter().cloned()) {
                 let len = *ol.get(&n).unwrap_or(&0);
-                let (sym, val) = declare("q_", &n, &t, len, &mut dummy, false, bounds.int_bound, &mut ranges, &mut needs_opt, true, types, &mut dts)?;
+                let (sym, val) = declare("q!", &n, &t, len, &mut dummy, false, bounds.int_bound, &mut ranges, &mut needs_opt, true, types, &mut dts)?;
                 let sort: String = match &t {
                     RType::Seq(e, _) => sort_of(e, types)?,
                     other => sort_of(other, types)?,
@@ -1738,13 +1976,14 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
             existence_parts.push(if qvars.is_empty() { body } else { format!("(forall ({}) {})", qvars.join(" "), body) });
         }
         outputs.push(Vec::new());
-    } else {
+    } else if check != Check::PreSat {
         for c in 0..copies {
-            let prefix = if copies == 2 { format!("o{}_", c + 1) } else { String::new() };
+            let prefix = if copies == 2 { format!("o{}!", c + 1) } else { String::new() };
             let mut group = Vec::new();
             let mut binds = Vec::new();
             for (n, t) in d.outputs() {
-                let len = *lens.get(&n).unwrap_or(&0);
+                let key = if c == 1 { format!("second!{n}") } else { n.clone() };
+                let len = *lens.get(&key).unwrap_or(&0);
                 // outputs keep their full type range even in the small phase:
                 // bounding them would manufacture "no output" counterexamples
                 let (sym, val) = declare(&prefix, &n, &t, len, &mut decl_lines, false, bounds.int_bound, &mut side, &mut needs_opt, false, types, &mut dts)?;
@@ -1771,11 +2010,8 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
     }
     let mut wf_flags = Vec::new();
     let mut text = String::new();
-    if needs_opt || lo.needs_opt {
-        text.push_str("(declare-datatype OptInt ((none) (some (val Int))))\n");
-    }
     dts.extend(lo.datatypes.iter().cloned());
-    for l in datatype_decls(&dts, types)? {
+    for l in datatype_decls(&dts, types, needs_opt || lo.needs_opt)? {
         text.push_str(&l);
         text.push('\n');
     }
@@ -1803,6 +2039,7 @@ fn build(d: &Decl, decls: &HashMap<String, &Decl>, types: &TypeDefs, bounds: &Bo
             text.push_str(&format!("(assert {})\n(assert {})\n", specs[0], specs[1]));
             let mut eqs = Vec::new();
             for (a, b) in outputs[0].iter().zip(outputs[1].iter()) {
+                if a.smt.len() != b.smt.len() { eqs.push("false".into()); }
                 for (x, y) in a.smt.iter().zip(b.smt.iter()) {
                     eqs.push(format!("(= {x} {y})"));
                 }
@@ -1895,7 +2132,7 @@ fn len_literals(d: &Decl) -> Vec<usize> {
 /// length the declaration pins by a literal (capped).
 fn output_len_bound(d: &Decl, max_len: usize) -> usize {
     let lit = len_literals(d).into_iter().filter(|&n| n <= 32).max().unwrap_or(0);
-    (2 * max_len).max(lit)
+    max_len.saturating_mul(2).max(lit)
 }
 
 /// The implementer's choices at the top level of the body (under no `for`,
@@ -1912,15 +2149,22 @@ fn top_choices(d: &Decl) -> Vec<(String, RType)> {
 
 /// All assignments of lengths to the sequence-typed variables: inputs (and
 /// top-level choices) up to `max_len`, outputs up to `output_len_bound`.
-fn length_assignments(d: &Decl, max_len: usize, inputs_only: bool) -> Vec<HashMap<String, usize>> {
+fn length_assignments(d: &Decl, max_len: usize, check: Check) -> R<Vec<HashMap<String, usize>>> {
+    let inputs_only = matches!(check, Check::Existence | Check::PreSat);
     let out_max = output_len_bound(d, max_len);
     let mut ins: Vec<(String, usize)> = d.inputs().into_iter().filter(|(_, t)| t.is_seq()).map(|(n, _)| (n, max_len)).collect();
     if !inputs_only {
         ins.extend(top_choices(d).into_iter().filter(|(_, t)| t.is_seq()).map(|(n, _)| (n, max_len)));
     }
-    let outs: Vec<(String, usize)> = if inputs_only { Vec::new() } else { d.outputs().into_iter().filter(|(_, t)| t.is_seq()).map(|(n, _)| (n, out_max)).collect() };
+    let mut outs: Vec<(String, usize)> = if inputs_only { Vec::new() } else { d.outputs().into_iter().filter(|(_, t)| t.is_seq()).map(|(n, _)| (n, out_max)).collect() };
+    if check == Check::Unambiguous {
+        outs.extend(outs.clone().into_iter().map(|(n, m)| (format!("second!{n}"), m)));
+    }
     let mut out = vec![HashMap::new()];
     for (v, m) in ins.into_iter().chain(outs) {
+        if out.len().saturating_mul(m.saturating_add(1)) > 4096 {
+            return Err("smoke-test length combinations exceed 4096; lower --max-len".into());
+        }
         let mut next = Vec::new();
         for a in &out {
             for len in 0..=m {
@@ -1931,7 +2175,7 @@ fn length_assignments(d: &Decl, max_len: usize, inputs_only: bool) -> Vec<HashMa
         }
         out = next;
     }
-    out
+    Ok(out)
 }
 
 struct Found {
@@ -1948,7 +2192,7 @@ fn run_check(z3: &mut Z3, d: &Decl, decls: &HashMap<String, &Decl>, types: &Type
     let mut total = 0usize;
     let mut unknown = false;
     let mut any_partial = false;
-    for lens in length_assignments(d, bounds.max_len, check == Check::Existence) {
+    for lens in length_assignments(d, bounds.max_len, check)? {
         let q = build(d, decls, types, bounds, small, &lens, check)?;
         if std::env::var("DJINN_SMOKE_DUMP").is_ok() {
             eprintln!(";; ---- {} {:?} small={small} lens={:?}\n{}", d.name, check, lens, q.text);
@@ -1969,13 +2213,15 @@ fn run_check(z3: &mut Z3, d: &Decl, decls: &HashMap<String, &Decl>, types: &Type
         let mut n_here = 0;
         loop {
             let r = z3.check_sat();
+            z3.failure()?;
             if r.starts_with("sat") {
                 let model = z3.get_value(&vars);
+                z3.failure()?;
                 n_here += 1;
                 total += 1;
                 if found.len() < 3 {
                     let ins = q.inputs.iter().map(|s| format!("{} = {}", s.name, show(s, &model))).collect::<Vec<_>>().join(", ");
-                    let outs = if q.outputs.len() == 1 && q.outputs[0].is_empty() {
+                    let outs = if q.outputs.is_empty() || (q.outputs.len() == 1 && q.outputs[0].is_empty()) {
                         String::new()
                     } else if q.outputs.len() == 2 {
                         let a = q.outputs[0].iter().map(|s| format!("{} = {}", s.name, show(s, &model))).collect::<Vec<_>>().join(", ");
@@ -1988,6 +2234,7 @@ fn run_check(z3: &mut Z3, d: &Decl, decls: &HashMap<String, &Decl>, types: &Type
                     if !q.wf_flags.is_empty() {
                         let names: Vec<String> = q.wf_flags.iter().map(|(n, _)| n.clone()).collect();
                         let flags = z3.get_value(&names);
+                        z3.failure()?;
                         let hits: Vec<&str> = q.wf_flags.iter().filter(|(n, _)| flags.get(n).map(|v| v == "true").unwrap_or(false)).map(|(_, w)| w.as_str()).collect();
                         why = hits.join("; ");
                     }
@@ -2111,6 +2358,9 @@ pub fn smoke_run_sources(srcs: &[String], bounds: &Bounds) -> std::result::Resul
 }
 
 fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bounds) -> std::result::Result<SmokeReport, String> {
+    if bounds.max_len > 32 || !(0..=1024).contains(&bounds.int_bound) || bounds.max_examples == 0 || bounds.timeout_ms == 0 {
+        return Err("smoke-test requires max_len <= 32, int_bound in 0..=1024, and positive max_examples and timeout_ms".into());
+    }
     let decls = &prog.decls;
     let types = &prog.types;
     let map: HashMap<String, &Decl> = decls.iter().map(|d| (d.name.clone(), d)).collect();
@@ -2146,18 +2396,15 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
         let mut reports = Vec::new();
         // preconditions first: if they cannot be met within the input bounds,
         // every other check would be vacuous (and possibly huge)
-        let pre_ok = match run_check(&mut z3, d, &map, types, bounds, false, Check::PreSat) {
-            Ok((found, _, _)) => !found.is_empty(),
-            Err(_) => true,
+        let pre_status = match run_check(&mut z3, d, &map, types, bounds, false, Check::PreSat) {
+            Ok((found, _, _)) if !found.is_empty() => None,
+            Ok((_, _, true)) => Some("solver returned unknown or timed out; precondition check is inconclusive".into()),
+            Ok(_) => Some(format!("cannot be met within the bounds (input sequences up to length {}): raise --max-len / --int-bound", bounds.max_len)),
+            Err(error) => Some(error),
         };
-        if !pre_ok {
-            reports.push(CheckReport {
-                label: "preconditions".into(),
-                status: CheckStatus::Unsupported(format!(
-                    "cannot be met within the bounds (input sequences up to length {}): raise --max-len / --int-bound",
-                    bounds.max_len
-                )),
-            });
+        if let Some(message) = pre_status {
+            all_ok = false;
+            reports.push(CheckReport { label: "preconditions".into(), status: CheckStatus::Unsupported(message) });
             let st = d.name_span.start();
             out.push(DeclReport { name: d.name.clone(), kind: kind.into(), line: st.line, col: st.column + 1, file: d.file, checks: reports });
             continue;
@@ -2188,6 +2435,7 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                 (None, Some(e)) if e == "no partial operations" => CheckStatus::NotApplicable,
                 (None, Some(e)) => CheckStatus::Unsupported(e),
                 (None, None) => CheckStatus::Unsupported("no result".into()),
+                (Some((None, true)), _) => CheckStatus::Unsupported("solver returned unknown or timed out; check is inconclusive".into()),
                 (Some((hit, unknown)), _) => match (check, hit) {
                     (Check::Consistent, Some((found, _, _))) => {
                         let f = &found[0];
@@ -2205,7 +2453,7 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                         let mut conflicts = Vec::new();
                         let mut title = String::new();
                         let mut example_input = None;
-                        for lens in length_assignments(d, bounds.max_len, false) {
+                        for lens in length_assignments(d, bounds.max_len, Check::Consistent)? {
                             if let Ok(Some((core, example))) = explain(&mut z3, d, &map, types, bounds, true, &lens, None) {
                                 title = conflict_title(core.len(), false).to_string();
                                 conflicts = conflict_pairs(d, &file_lines[d.file], &core);
@@ -2281,11 +2529,13 @@ fn smoke_run_program(prog: &djinn_syntax::Program, srcs: &[String], bounds: &Bou
                     },
                 },
             };
+            if matches!(status, CheckStatus::Unsupported(_)) { all_ok = false; }
             reports.push(CheckReport { label, status });
         }
         let st = d.name_span.start();
         out.push(DeclReport { name: d.name.clone(), kind: kind.into(), line: st.line, col: st.column + 1, file: d.file, checks: reports });
     }
+    if out.is_empty() { all_ok = false; }
     Ok(SmokeReport { decls: out, all_ok })
 }
 
@@ -2333,10 +2583,12 @@ pub fn print_report(r: &SmokeReport, bounds: &Bounds, paths: &[String]) {
         }
     }
     println!();
-    if r.all_ok {
+    if !r.decls.is_empty() && r.decls.iter().all(|d| d.checks.iter().all(|c| matches!(c.status, CheckStatus::Skipped))) {
+        println!("smoke-test: all checks explicitly skipped by #[override_smoke_test].");
+    } else if r.all_ok {
         println!("smoke-test: no contradiction and no counterexample within the bounds (this is not a proof).");
     } else {
-        println!("smoke-test: problems found; fix the specification before paying an agent.");
+        println!("smoke-test: problems found or checks incomplete; review the results before paying an agent.");
     }
 }
 

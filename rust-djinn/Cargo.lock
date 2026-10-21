@@ -38,6 +38,7 @@ version = "0.1.0"
 dependencies = [
  "ctrlc",
  "djinn-syntax",
+ "libc",
  "proc-macro2",
  "quote",
  "serde",
